@@ -32,7 +32,8 @@ Core dependencies are installed automatically. For segmentation vignettes, insta
 # collides with the opencv-python this project already depends on
 pip install cellpose --no-deps
 pip install torch torchvision fastremap imagecodecs roifile fill-voids segment_anything
-pip install stardist
+# stardist needs TensorFlow, which it doesn't pull in automatically
+pip install stardist tensorflow
 ```
 
 For interactive ROI drawing:
