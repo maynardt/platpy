@@ -3,9 +3,9 @@ import numpy as np
 import dask.array as da
 from typing import Union, Tuple, Optional, List, Dict
 
-# Spackle imports
+# platpy imports
 from .base_channel import BaseChannel
-from spackle.transform_utils import SpatialMetadata
+from platpy.transform_utils import SpatialMetadata
 
 @dataclass
 class ImageChannel(BaseChannel):

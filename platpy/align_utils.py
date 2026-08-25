@@ -1,5 +1,5 @@
 """
-Fine alignment utilities for SPACKLE.
+Fine alignment utilities for platpy.
 
 Corrects the small (~3-4 µm) residual misalignment between Visium spot positions
 and the fullres morphology image that SpaceRanger's affine registration leaves behind.

@@ -87,7 +87,7 @@ def micro_finetune_roi(master_sample, macro_poly_microns, new_name, image_key='D
         angle = angle_slider.value
 
         # roi_layer.data[0] is (N,2) in Napari's (row, col) = (Y, X) order
-        # Swap to (X, Y) to match Spackle convention
+        # Swap to (X, Y) to match platpy convention
         roi_yx = roi_layer.data[0]
         roi_px = roi_yx[:, [1, 0]]
 

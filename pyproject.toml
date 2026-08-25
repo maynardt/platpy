@@ -3,9 +3,9 @@ requires = ["setuptools>=61", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "spackle"
+name = "platpy"
 version = "0.1.0"
-description = "Spatial Platform for Analysis of Composite stacKs and Layered data Extraction"
+description = "Pipeline for Layered Analysis of Transcriptomics"
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.9"
@@ -42,4 +42,4 @@ dev = ["jupyter", "ipywidgets"]
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["spackle*"]
+include = ["platpy*"]

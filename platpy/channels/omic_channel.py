@@ -1,10 +1,10 @@
 ﻿from dataclasses import dataclass, field
 from typing import Any, Tuple, Dict, Optional
 
-# Spackle imports
+# platpy imports
 from .base_channel import BaseChannel
 from .image_channel import ImageChannel
-from spackle.transform_utils import SpatialMetadata
+from platpy.transform_utils import SpatialMetadata
 
 @dataclass
 class OmicChannel(BaseChannel):

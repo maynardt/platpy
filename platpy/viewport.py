@@ -4,7 +4,7 @@ import cv2
 from typing import List, Dict, Tuple, Union, Optional
 import copy
 
-# Spackle imports
+# platpy imports
 from .channels.image_channel import ImageChannel
 from .channels.omic_channel import OmicChannel
 from .channels.roi_channel import ROIChannel

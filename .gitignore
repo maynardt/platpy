@@ -27,7 +27,7 @@ __working/
 _old_example_code/
 TODO.md
 dataport_sprint.md
-spackle_data/
+platpy_data/
 
 # Data / large files
 *.zip

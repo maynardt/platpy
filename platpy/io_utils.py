@@ -17,7 +17,7 @@ from typing import Optional, Any, Dict
 # compatible with our mixed dask/numpy data structures and the zarr_format=2 API.
 warnings.filterwarnings("ignore", message=".*zarr v2.*", category=UserWarning)
 
-# Spackle imports
+# platpy imports
 from .channels import SampleSet, CellChannel, ImageChannel, OmicChannel, ROIChannel
 from .transform_utils import SpatialMetadata 
 
@@ -174,7 +174,7 @@ def save_sample(
     **kwargs
 ):
     """
-    Saves a Spackle SampleSet to disk as a unified Zarr directory structure.
+    Saves a platpy SampleSet to disk as a unified Zarr directory structure.
     
     Args:
         sample: The SampleSet to save.
@@ -190,7 +190,7 @@ def save_sample(
         )
 
     out_path.mkdir(parents=True, exist_ok=True)
-    logger.info(f"Saving Spackle Sample '{sample.name}' to {out_path}")
+    logger.info(f"Saving platpy Sample '{sample.name}' to {out_path}")
 
     # Force zarr v2 format throughout — consistent, portable, avoids v3 codec mismatches.
     compressor = numcodecs.Blosc(cname='lz4', clevel=clevel, shuffle=numcodecs.Blosc.BITSHUFFLE)
@@ -349,7 +349,7 @@ def save_sample(
 
 def load_sample(in_path_str: str, verbose: bool = True, load_2um_bin: bool = False, images_only: bool = False) -> SampleSet:
     """
-    Loads a Spackle SampleSet from a Zarr directory structure.
+    Loads a platpy SampleSet from a Zarr directory structure.
     Images are loaded as lazy dask arrays to preserve RAM.
     """
     in_path = Path(in_path_str)
@@ -357,7 +357,7 @@ def load_sample(in_path_str: str, verbose: bool = True, load_2um_bin: bool = Fal
     if not in_path.exists():
         raise FileNotFoundError(f"Sample directory not found: {in_path}")
         
-    logger.info(f"Loading Spackle Sample from {in_path}")
+    logger.info(f"Loading platpy Sample from {in_path}")
 
     with open(in_path / "sample_meta.json", 'r') as f:
         sample_info = json.load(f)

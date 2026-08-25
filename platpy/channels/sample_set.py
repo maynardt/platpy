@@ -8,7 +8,7 @@ from .roi_channel import ROIChannel
 
 @dataclass
 class SampleSet:
-    """The core organizational unit of SPACKLE."""
+    """The core organizational unit of platpy."""
     name: str
     images: Dict[str, ImageChannel] = field(default_factory=dict)
     omics:  Dict[str, OmicChannel]  = field(default_factory=dict)

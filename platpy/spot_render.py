@@ -1,7 +1,7 @@
 ﻿import numpy as np
 from typing import Optional, Tuple
 
-# Spackle imports
+# platpy imports
 from .channels.image_channel import ImageChannel
 from .channels.omic_channel import OmicChannel
 from .transform_utils import SpatialMetadata, create_transform_matrix

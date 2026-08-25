@@ -1,5 +1,5 @@
 """
-SPACKLE — Spatial Platform for Analysis of Composite stacKs and Layered data Extraction
+platpy — Pipeline for Layered Analysis of Transcriptomics
 
 A Python framework for spatial transcriptomics analysis providing a unified
 micron-space coordinate system across imaging, spot, and transcript data.

@@ -10,7 +10,7 @@ import dask
 import dask.array as da
 import tifffile
 
-# Import core Spackle architecture (Visium Parity)
+# Import core platpy architecture (Visium Parity)
 from .channels import SampleSet, CellChannel, ImageChannel, OmicChannel
 from .transform_utils import SpatialMetadata, create_transform_matrix
 from .io_utils import build_spatial_block_index
@@ -32,7 +32,7 @@ def _load_boundaries(x_dir: Path) -> Optional[CellChannel]:
             df = pd.read_csv(bounds_path)
             
         # ==========================================
-        # SPACKLE STANDARDIZATION
+        # platpy STANDARDIZATION
         # Translate Xenium 'vertex_x' to standard 'x'
         # ==========================================
         rename_map = {}
@@ -72,7 +72,7 @@ def _load_transcripts(x_dir: Path) -> Optional[OmicChannel]:
             df = df[[c for c in core_cols if c in df.columns]]
             
         # ==========================================
-        # SPACKLE STANDARDIZATION
+        # platpy STANDARDIZATION
         # Translate Xenium coordinates to standard 'x', 'y', and 'feature'
         # ==========================================
         rename_map = {}
@@ -113,7 +113,7 @@ def _load_transcripts(x_dir: Path) -> Optional[OmicChannel]:
 
 def load_xenium(x_dir: str | Path, name: str = "XeniumSample", load_boundaries: bool = True, force_8bit=True, debug: bool = False) -> SampleSet:
     """
-    Ingests a Xenium output directory into the Spackle framework.
+    Ingests a Xenium output directory into the platpy framework.
     Maps morphology images to the Visium multi-res standard using Dask/Zarr
     and Absolute Spatial Truth (Affine Matrices).
     """

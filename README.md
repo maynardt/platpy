@@ -1,7 +1,7 @@
-# SPACKLE
-### Spatial Platform for Analysis of Composite stacKs and Layered data Extraction
+# platpy
+### Pipeline for Layered Analysis of Transcriptomics
 
-SPACKLE is a Python framework for spatial transcriptomics analysis. It allows you to work with spatial datasets in a unified space (microns), and it keeps imaging, spot-level, and transcript-level data in perfect registration regardless of the spatial platform, imaging resolution, or analysis operation applied.
+platpy is a Python framework for spatial transcriptomics analysis. It allows you to work with spatial datasets in a unified space (microns), and it keeps imaging, spot-level, and transcript-level data in perfect registration regardless of the spatial platform, imaging resolution, or analysis operation applied.
 
 ---
 
@@ -20,7 +20,7 @@ SPACKLE is a Python framework for spatial transcriptomics analysis. It allows yo
 ## Installation
 
 ```bash
-pip install git+https://github.com/maynardt/spackle.git
+pip install git+https://github.com/maynardt/platpy.git
 ```
 
 ### Dependencies
@@ -43,9 +43,9 @@ pip install napari
 ## Quick Start
 
 ```python
-from spackle import load_sample, ViewPort
+from platpy import load_sample, ViewPort
 
-# Load a pre-processed SPACKLE bundle
+# Load a pre-processed platpy bundle
 sample = load_sample('path/to/VisiumSample')
 
 # Create a viewport and render a multi-channel view
@@ -53,7 +53,7 @@ vp = sample.viewport(center_um=(2000, 3000), fov_um=(1000, 800))
 vp.add_layer(sample.images['dapi']).adjust_layer(tint='xkcd:bright blue', percentile_clip=(2, 99))
 vp.add_layer(sample.omics['spots']).adjust_layer(gene_name='total_counts', cmap_name='inferno')
 
-from spackle.plot_utils import plot_image_grid
+from platpy.plot_utils import plot_image_grid
 plot_image_grid(vp.render(), width=6)
 ```
 
@@ -65,8 +65,8 @@ Step-by-step vignettes are in the [`vignettes/`](vignettes/) directory:
 
 | Vignette | Description |
 |----------|-------------|
-| [00 — Data loading](vignettes/Vignette_00_data_loading.ipynb) | Convert raw 10x outputs to SPACKLE format (not needed to run pre-generated sample datasets) |
-| [01 — Spatial registration](vignettes/Vignette_01_spatial_registration.ipynb) | The registration problem and how SPACKLE solves it |
+| [00 — Data loading](vignettes/Vignette_00_data_loading.ipynb) | Convert raw 10x outputs to platpy format (not needed to run pre-generated sample datasets) |
+| [01 — Spatial registration](vignettes/Vignette_01_spatial_registration.ipynb) | The registration problem and how platpy solves it |
 | [02 — Virtual views](vignettes/Vignette_02_virtual_views.ipynb) | ViewPort: compositing, orientation, Napari ROI drawing |
 | [03 — DataPort](vignettes/Vignette_03_dataport.ipynb) | ROI extraction, CellPose/StarDist segmentation |
 | [04 — Multi-platform](vignettes/Vignette_04_multi_platform_workflow.ipynb) | Xenium on the same API as Visium |
@@ -80,9 +80,9 @@ Sample datasets for all vignettes are downloaded automatically on first run from
 
 ## Citation
 
-If you use SPACKLE in your research, please cite:
+If you use platpy in your research, please cite:
 
-> Maynard, T. (2026). SPACKLE: Spatial Platform for Analysis of Composite stacKs and Layered data Extraction. *bioRxiv*. [link to follow]
+> Maynard, T. (2026). platpy: Pipeline for Layered Analysis of Transcriptomics. *bioRxiv*. [link to follow]
 
 ---
 

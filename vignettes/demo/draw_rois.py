@@ -1,5 +1,5 @@
 """
-draw_rois.py  --  Interactive ROI drawing tool for SPACKLE
+draw_rois.py  --  Interactive ROI drawing tool for platpy
 
 Run directly from the terminal (not in Jupyter):
     python demo/draw_rois.py
@@ -33,14 +33,14 @@ import napari
 from magicgui.widgets import Container, LineEdit, PushButton, Label
 from qtpy.QtCore import QEventLoop
 
-from spackle.io_utils import load_sample
-from spackle.transform_utils import pixels_to_microns
-from spackle.spatial_tools import save_rois
+from platpy.io_utils import load_sample
+from platpy.transform_utils import pixels_to_microns
+from platpy.spatial_tools import save_rois
 
 # =============================================================================
 # CONFIG -- edit these for your dataset
 # =============================================================================
-SAMPLE_PATH   = Path.home() / 'spackle_data' / 'XeniumSamples' / 'WT_02'
+SAMPLE_PATH   = Path.home() / 'platpy_data' / 'XeniumSamples' / 'WT_02'
 IMAGE_KEY     = "DAPI"                        # image channel to display
 OUTPUT_JSON   = Path(__file__).parent / "WT_02_rois.json"
 DISPLAY_WIDTH = 2000                               # px -- lighter = faster
@@ -71,7 +71,7 @@ def main():
     combined  = {}   # populated on save; returned from main()
 
     # -------------------------------------------------------------------------
-    viewer = napari.Viewer(title="SPACKLE -- Draw ROIs")
+    viewer = napari.Viewer(title="platpy -- Draw ROIs")
     viewer.add_image(img, name=IMAGE_KEY, colormap="gray")
 
     shapes_layer = viewer.add_shapes(

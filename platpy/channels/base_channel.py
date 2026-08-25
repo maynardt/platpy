@@ -1,11 +1,11 @@
 ﻿from dataclasses import dataclass, field
 from typing import Dict, Any
 import numpy as np
-from spackle.transform_utils import SpatialMetadata, pixels_to_microns as _px_to_um, microns_to_pixels as _um_to_px
+from platpy.transform_utils import SpatialMetadata, pixels_to_microns as _px_to_um, microns_to_pixels as _um_to_px
 
 @dataclass
 class BaseChannel:
-    """The fundamental building block of SPACKLE."""
+    """The fundamental building block of platpy."""
     name: str
     spatial_meta: SpatialMetadata = field(default_factory=SpatialMetadata)
     metadata: Dict[str, Any] = field(default_factory=dict)

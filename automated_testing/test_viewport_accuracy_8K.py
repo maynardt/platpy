@@ -5,7 +5,7 @@ import time
 from scipy.spatial import KDTree
 from typing import Dict, List, Tuple
 
-# SPACKLE imports
+# platpy imports
 from channels.image_channel import ImageChannel
 from transform_utils import SpatialMetadata, create_transform_matrix
 from viewport import ViewPort
@@ -113,7 +113,7 @@ def run_scale_sweep(
     scale_fraction = source_mpp / render_mpp  (1.0 = native, 0.05 = 20x downscale)
     """
     print("==============================================")
-    print(" SPACKLE: Scale Sweep Accuracy Test")
+    print(" platpy: Scale Sweep Accuracy Test")
     print("==============================================")
 
     w_um = w_px * mpp
@@ -251,7 +251,7 @@ def run_highres_test(
     region of the canvas have systematically higher error?
     """
     print("==============================================")
-    print(" SPACKLE: High-Res 1:1 Accuracy Test")
+    print(" platpy: High-Res 1:1 Accuracy Test")
     print("==============================================")
 
     w_um   = w_px * mpp

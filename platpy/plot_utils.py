@@ -5,7 +5,7 @@ import dask.array as da
 from dataclasses import dataclass, field
 from typing import List, Union, Optional, Any
 
-# Spackle imports
+# platpy imports
 from .channels import ImageChannel
 
 @dataclass

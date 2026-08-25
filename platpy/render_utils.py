@@ -5,7 +5,7 @@ from numba import njit, prange
 from typing import Union, Optional, Tuple, List, Dict
 import dask.array as da
 
-# Spackle imports
+# platpy imports
 from .channels.image_channel import ImageChannel
 from .channels.omic_channel import OmicChannel
 from .transform_utils import SpatialMetadata
@@ -323,7 +323,7 @@ def render_omic_to_image(
 
     # --- Visium path: fast grid-aligned spot renderer ---
     if "bin_size_um" in omic.metadata:
-        from spackle.spot_render import render_spotset_to_image
+        from platpy.spot_render import render_spotset_to_image
         values = _extract_gene_values(omic, gene_name)
         spot_shape = omic.metadata.get('geometry_type', 'square')
         spot_kwargs = {k: v for k, v in kwargs.items() if k in _SPOT_RENDER_KWARGS}

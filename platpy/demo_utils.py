@@ -9,7 +9,7 @@ from pathlib import Path
 
 def fetch_zenodo_bundle(dest, url):
     """
-    Download and extract a SPACKLE bundle from Zenodo (one-time; skips if already present).
+    Download and extract a platpy bundle from Zenodo (one-time; skips if already present).
 
     Parameters
     ----------
