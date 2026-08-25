@@ -19,7 +19,14 @@ classifiers = [
 dependencies = [
     "numpy>=2.0,<3",
     "pandas>=2.0,<3",
-    "dask[array]>=2024.1",
+    # <2025: newer dask fully removes the legacy (non dask-expr) dataframe
+    # engine, which the `analysis` extra's spatialdata dependency still
+    # requires (it force-disables query-planning on import).
+    "dask[array]>=2024.1,<2025",
+    # <3: io_utils.py writes images via a direct zarr.open_group().require_dataset(
+    # compressor=...) call using the legacy numcodecs compressor API, which
+    # zarr 3.x's array-creation codec pipeline rejects. A move to zarr 3 needs
+    # that write path updated first -- see platpy_migration_plan.md Item 0.
     "zarr>=2.18,<3",
     "numcodecs>=0.12,<1",
     "anndata>=0.10",
@@ -35,8 +42,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-interactive = ["napari>=0.5", "magicgui", "qtpy"]
-analysis = ["squidpy>=1.4"]
+interactive = ["napari>=0.5", "magicgui", "qtpy", "pyqt6"]
+# <1.7: squidpy>=1.7 pulls a modern spatialdata that requires zarr>=3 (see the
+# zarr pin above for why that's not compatible with this codebase yet).
+# setuptools<81: a squidpy/spatialdata transitive dep (xarray_schema) still
+# imports pkg_resources, which setuptools>=81 no longer bundles.
+analysis = ["squidpy>=1.4,<1.7", "setuptools<81"]
 harmony = ["harmonypy"]
 dev = ["jupyter", "ipywidgets"]
 

@@ -28,7 +28,10 @@ pip install git+https://github.com/maynardt/platpy.git
 Core dependencies are installed automatically. For segmentation vignettes, install CellPose and/or StarDist separately:
 
 ```bash
-pip install cellpose
+# --no-deps avoids cellpose pulling in opencv-python-headless, which
+# collides with the opencv-python this project already depends on
+pip install cellpose --no-deps
+pip install torch torchvision fastremap imagecodecs roifile fill-voids segment_anything
 pip install stardist
 ```
 
