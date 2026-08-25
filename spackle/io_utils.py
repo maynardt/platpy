@@ -1,0 +1,509 @@
+﻿import json
+import logging
+import shutil
+import os
+import stat
+import warnings
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import dask.array as da
+import zarr
+import anndata as ad
+import numcodecs
+from typing import Optional, Any, Dict
+
+# Zarr v3 warns when writing v2 format, but v2 is intentional here — it's more
+# compatible with our mixed dask/numpy data structures and the zarr_format=2 API.
+warnings.filterwarnings("ignore", message=".*zarr v2.*", category=UserWarning)
+
+# Spackle imports
+from .channels import SampleSet, CellChannel, ImageChannel, OmicChannel, ROIChannel
+from .transform_utils import SpatialMetadata 
+
+logger = logging.getLogger(__name__)
+
+
+def build_spatial_block_index(adata, mpp, chunk_px=1024, gene_col=None):
+    """
+    Sort AnnData rows by spatial Dask block (aligned to chunk_px x mpp microns),
+    then optionally by gene within each block. Stores a block->row-range lookup
+    in adata.uns['block_index']. Done once at initial load; persists in Zarr.
+
+    Parameters
+    ----------
+    adata     : AnnData with obsm['spatial'] = (N, 2) float [x_um, y_um]
+    mpp       : float — microns per pixel of the reference morphology image
+    chunk_px  : int   — image chunk size in pixels (default 1024, matches io_utils save)
+    gene_col  : str or None — obs column for secondary sort (e.g. 'feature' for Xenium)
+
+    Returns
+    -------
+    adata_sorted : new AnnData with rows reordered; original is unchanged
+    """
+    block_um = chunk_px * mpp
+    coords = adata.obsm['spatial']  # (N, 2): col0=x, col1=y
+    assert not np.any(np.isnan(coords)), "NaN coordinates in obsm['spatial'] — cannot sort by block"
+
+    # Floor division (not truncation) so negative coordinates land in the correct block.
+    # e.g. x=-400, block_um=333: floor gives bx=-2 (correct), int() gives bx=-1 (wrong).
+    bx = np.floor(coords[:, 0] / block_um).astype(int)
+    by = np.floor(coords[:, 1] / block_um).astype(int)
+
+    if gene_col is not None:
+        sort_df = pd.DataFrame({'by': by, 'bx': bx, 'gene': adata.obs[gene_col].values})
+        order = sort_df.sort_values(['by', 'bx', 'gene']).index.to_numpy()
+    else:
+        sort_df = pd.DataFrame({'by': by, 'bx': bx})
+        order = sort_df.sort_values(['by', 'bx']).index.to_numpy()
+
+    adata_sorted = adata[order].copy()
+
+    # Find contiguous runs using pairwise comparison — avoids hash collisions with negative indices.
+    s_bx = bx[order]
+    s_by = by[order]
+    same_block = (s_bx[1:] == s_bx[:-1]) & (s_by[1:] == s_by[:-1])
+    change_mask = np.concatenate([[True], ~same_block])
+    starts = np.where(change_mask)[0]
+    ends = np.concatenate([starts[1:], [len(adata_sorted)]])
+
+    # 1e-6 µm (sub-nanometer) margin guards against FP rounding at block boundaries.
+    # block_um (= chunk_px * mpp) is not exactly representable in float64, so
+    # floor(x / block_um) * block_um can be fractionally larger than x for boundary transcripts.
+    eps = 1e-6
+    blocks = [
+        {
+            'bx': int(s_bx[starts[k]]), 'by': int(s_by[starts[k]]),
+            'min_x': float(s_bx[starts[k]] * block_um) - eps,
+            'max_x': float((s_bx[starts[k]] + 1) * block_um) + eps,
+            'min_y': float(s_by[starts[k]] * block_um) - eps,
+            'max_y': float((s_by[starts[k]] + 1) * block_um) + eps,
+            'row_start': int(starts[k]),
+            'row_end':   int(ends[k]),
+            'n':         int(ends[k] - starts[k]),
+        }
+        for k in range(len(starts))
+    ]
+
+    # Add coarse first-letter gene index within each block (Xenium only — gene_col must be set).
+    # Genes are already sorted alphabetically within each block, so searchsorted finds boundaries
+    # in O(log n) at query time with zero extra storage overhead beyond these small per-block dicts.
+    if gene_col is not None:
+        gene_vals = adata_sorted.obs[gene_col].values
+        for b in blocks:
+            genes = gene_vals[b['row_start']:b['row_end']]
+            letters = sorted(set(g[0].upper() for g in genes if g))
+            b['letter_offsets'] = {
+                letter: (
+                    int(np.searchsorted(genes, letter)),
+                    int(np.searchsorted(genes, chr(ord(letter) + 1), 'left'))
+                )
+                for letter in letters
+            }
+
+    # Store as a JSON string — AnnData's zarr backend converts list-of-dicts
+    # entries in uns to str() representations (single quotes, not JSON-compatible).
+    # A single string value round-trips correctly through zarr.
+    adata_sorted.uns['block_index'] = json.dumps({
+        'block_size_um': float(block_um),
+        'mpp':           float(mpp),
+        'chunk_px':      int(chunk_px),
+        'blocks':        blocks,
+    })
+    return adata_sorted
+
+
+def _remove_readonly(func, path, exc):
+    """Clear the readonly bit and re-attempt purge (Windows fix)."""
+    os.chmod(path, stat.S_IWRITE)
+    func(path)
+
+def _numpy_encoder(obj: Any) -> Any:
+    """Helper to convert numpy arrays/types to standard JSON for Zarr attributes."""
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, (np.integer, np.floating)):
+        return float(obj)
+    return str(obj)
+
+def _get_channel_info_string(d_arr: da.Array) -> str:
+    """Returns a short string describing color space and bit-depth (e.g., '8g', '24c')."""
+    dtype = d_arr.dtype
+    bits = 8
+    if dtype == np.uint16: bits = 16
+    elif dtype in [np.float32, np.int32]: bits = 32
+    elif dtype == np.float64: bits = 64
+    
+    ctype = 'g'
+    if d_arr.ndim == 3:
+        if d_arr.shape[-1] in [3, 4]:
+            ctype = 'c'
+            if bits == 8: bits = d_arr.shape[-1] * 8
+            
+    return f"{bits}{ctype}"
+
+def _sanitize_for_zarr(obj: Any) -> Any:
+    """
+    Recursively converts dictionary values to JSON-serializable formats 
+    (handling NumPy scalars/arrays) before writing to Zarr/AnnData.
+    """
+    if isinstance(obj, dict):
+        return {k: _sanitize_for_zarr(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [_sanitize_for_zarr(v) for v in obj]
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, (np.integer, np.floating)):
+        return float(obj)
+    return obj
+
+################################
+## Save SampleSet to Zarr
+##
+## Saves both Images and Omics
+## in a unified directory
+## including metadta and ROIs.
+################################
+
+def save_sample(
+    sample: SampleSet,
+    out_prefix: str,
+    overwrite: bool = False,
+    clevel: int = 5,
+    keep_2um_bins: bool = False,
+    **kwargs
+):
+    """
+    Saves a Spackle SampleSet to disk as a unified Zarr directory structure.
+    
+    Args:
+        sample: The SampleSet to save.
+        out_prefix: Directory path to save the sample.
+        overwrite: If True, replaces existing data at out_prefix.
+        clevel: Compression level (0-9). Default 5. Uses Blosc LZ4 + Bitshuffle.
+    """
+    out_path = Path(out_prefix)
+    
+    if out_path.exists() and not overwrite:
+        raise FileExistsError(
+            f"Directory '{out_path}' already exists. Use overwrite=True to replace it."
+        )
+
+    out_path.mkdir(parents=True, exist_ok=True)
+    logger.info(f"Saving Spackle Sample '{sample.name}' to {out_path}")
+
+    # Force zarr v2 format throughout — consistent, portable, avoids v3 codec mismatches.
+    compressor = numcodecs.Blosc(cname='lz4', clevel=clevel, shuffle=numcodecs.Blosc.BITSHUFFLE)
+
+    # ========
+    # 1. Save Images (morph.zarr)
+    # ========  
+
+    if sample.images:
+        morph_path = out_path / "morph.zarr"
+        
+        # Explicitly remove existing morph directory if overwrite is enabled
+        if overwrite and morph_path.exists():
+            shutil.rmtree(morph_path, onexc=_remove_readonly)
+        
+        morph_path.mkdir(parents=True, exist_ok=True)
+        
+        for name, img_chan in sample.images.items():
+            img_data = img_chan.image
+            
+            root: Any = zarr.open_group(str(morph_path), mode='a') # type: ignore
+            chunks = (1024, 1024, 3) if img_data.ndim == 3 else (1024, 1024)
+            z = root.require_dataset(
+                name, shape=img_data.shape, chunks=chunks,
+                dtype=img_data.dtype, overwrite=True, compressor=compressor
+            )
+            if isinstance(img_data, da.Array):
+                da.store(img_data, z)
+            else:
+                z[:] = img_data
+            
+            safe_matrix = np.array(img_chan.spatial_meta.transform_matrix).tolist()
+            meta_dict = {
+                'transform_matrix': safe_matrix,
+                'local_bounds': img_chan.spatial_meta.local_bounds,
+                'unit': img_chan.spatial_meta.unit,
+                'name': img_chan.name,
+                'base_layer': img_chan.base_layer,
+                'user_metadata': img_chan.metadata
+            }
+            root[name].attrs.put(meta_dict) # type: ignore
+
+            # Save pre-computed pyramid levels so renders don't re-derive from full-res.
+            # Skipped when persist_pyramid=False (e.g. Xenium channels that already have
+            # _hires/_lowres companions acting as the pyramid).
+            # Key format: {name}__pyr{factor} where factor = 2, 4, 8, ...
+            base_mpp = img_chan.spatial_meta.transform_matrix[0, 0]
+            for level_mpp, level_arr in img_chan.pyramid.items():
+                if abs(level_mpp - base_mpp) < 1e-9:
+                    continue  # skip base level — already saved as the main component
+                factor = round(level_mpp / base_mpp)
+                pyr_key = f"{name}__pyr{factor}"
+                pyr_chunks = (1024, 1024, 3) if level_arr.ndim == 3 else (1024, 1024)
+                zp = root.require_dataset(
+                    pyr_key, shape=level_arr.shape, chunks=pyr_chunks,
+                    dtype=level_arr.dtype, overwrite=True, compressor=compressor
+                )
+                if isinstance(level_arr, da.Array):
+                    da.store(level_arr, zp)
+                else:
+                    zp[:] = level_arr
+                root[pyr_key].attrs.put({'mpp': float(level_mpp)})
+
+            logger.info(f"  + Saved Image: {name} ({len(img_chan.pyramid)} pyramid level(s), clevel={clevel})")
+
+    # ========
+    # 2. Save Omics (omics/{name}/ pyramid directory, one zarr per level)
+    # ========
+
+    # Drop 2µm bins before saving — they are artifact-laden (intensity banding)
+    # and the 4µm aggregated bin is a better starting point for all analyses.
+    if not keep_2um_bins:
+        for omic_chan in sample.omics.values():
+            if 2.0 in omic_chan.pyramid and 4.0 in omic_chan.pyramid:
+                del omic_chan.pyramid[2.0]
+                logger.info("  - Dropped 2µm bin before save (keep_2um_bins=False)")
+
+    if sample.omics:
+        omics_dir = out_path / "omics"
+        omics_dir.mkdir(exist_ok=True)
+        for name, omic_chan in sample.omics.items():
+            chan_dir = omics_dir / name
+            if overwrite and chan_dir.exists():
+                shutil.rmtree(chan_dir, onexc=_remove_readonly)
+            chan_dir.mkdir(exist_ok=True)
+
+            spatial_list = np.array(omic_chan.spatial_meta.transform_matrix).tolist()
+            channel_meta = _sanitize_for_zarr(omic_chan.metadata)
+
+            for bin_um, adata_level in omic_chan.pyramid.items():
+                if isinstance(adata_level, pd.DataFrame):
+                    adata_level = ad.AnnData(obs=adata_level)
+                adata_level.uns['spatial_meta'] = spatial_list
+                adata_level.uns['channel_meta'] = channel_meta
+                dest_path = chan_dir / f"{float(bin_um):.1f}um.zarr"
+                adata_level.write_zarr(dest_path)
+
+            logger.info(f"  + Saved Omic Channel: {name} (levels: {sorted(omic_chan.pyramid.keys())})")
+
+    # ========
+    # 3. Save Cells (cells/*.zarr)
+    # ========
+    if sample.cells:
+        cells_dir = out_path / "cells"
+        cells_dir.mkdir(exist_ok=True)
+        for name, cell_chan in sample.cells.items():
+            dest_path = cells_dir / f"{name}.zarr"
+            if overwrite and dest_path.exists():
+                shutil.rmtree(dest_path, onexc=_remove_readonly)
+                
+            adata: Any = cell_chan.boundaries
+            if isinstance(adata, pd.DataFrame):
+                df_obs = adata.reset_index(drop=True)
+                df_obs.index = df_obs.index.astype(str)
+                adata = ad.AnnData(obs=df_obs)
+            
+            adata.uns['spatial_meta'] = np.array(cell_chan.spatial_meta.transform_matrix).tolist()
+            # FIX: Persist cell channel metadata
+            adata.uns['channel_meta'] = _sanitize_for_zarr(cell_chan.metadata)
+            
+            adata.write_zarr(dest_path)
+            logger.info(f"  + Saved Cell Channel: {name}")
+
+
+    # ========
+    # 4. Save Core Metadata & ROIs
+    # ========
+    meta_path = out_path / "sample_meta.json"
+    sample_info = {
+        'name': sample.name,
+        'metadata': sample.metadata,
+        'rois': {}
+    }
+    
+    for name, roi_chan in sample.rois.items():
+        sample_info['rois'][name] = {
+            'polygons': {k: v.tolist() for k, v in roi_chan.polygons.items()},
+            'metadata': roi_chan.metadata
+        }
+        
+    with open(meta_path, 'w') as f:
+        json.dump(sample_info, f, default=_numpy_encoder, indent=4)
+        
+    logger.info("Successfully saved SampleSet.")
+    return True
+
+
+################################
+## Load SampleSet from Zarr
+##
+## Loads both Images and Omics
+## from a unified directory
+## including metadata and ROIs.
+################################
+
+
+def load_sample(in_path_str: str, verbose: bool = True, load_2um_bin: bool = False, images_only: bool = False) -> SampleSet:
+    """
+    Loads a Spackle SampleSet from a Zarr directory structure.
+    Images are loaded as lazy dask arrays to preserve RAM.
+    """
+    in_path = Path(in_path_str)
+
+    if not in_path.exists():
+        raise FileNotFoundError(f"Sample directory not found: {in_path}")
+        
+    logger.info(f"Loading Spackle Sample from {in_path}")
+
+    with open(in_path / "sample_meta.json", 'r') as f:
+        sample_info = json.load(f)
+
+    sample = SampleSet(name=sample_info['name'])
+    sample.metadata = sample_info.get('metadata', {})
+
+    morph_path = in_path / "morph.zarr"
+    summary_list = []
+    if morph_path.exists():
+        # Open with mode='r' (zarr auto-detects version on read)
+        root: Any = zarr.open_group(str(morph_path), mode='r') # type: ignore
+        for name in root.array_keys():
+            if '__pyr' in name:
+                continue  # pyramid level — attached to parent channel below
+            z_arr = root[name]
+            d_arr = da.from_zarr(z_arr)
+            info_str = _get_channel_info_string(d_arr)
+            summary_list.append(f"'{name}' ({info_str})")
+            
+            attrs = z_arr.attrs.asdict() # type: ignore
+            spatial = SpatialMetadata(
+                transform_matrix=np.array(attrs.get('transform_matrix', np.eye(3))),
+                local_bounds=attrs.get('local_bounds'),
+                unit=attrs.get('unit', 'microns')
+            )
+            img_chan = ImageChannel(
+                name=attrs.get('name', name),
+                image=d_arr,
+                spatial_meta=spatial,
+                metadata=attrs.get('user_metadata', {})
+            )
+            img_chan.base_layer = attrs.get('base_layer', None)
+
+            # Load pre-computed pyramid levels if saved; otherwise generate on-the-fly.
+            pyr_keys = [k for k in root.array_keys() if k.startswith(f"{name}__pyr")]
+            if pyr_keys:
+                for pyr_key in pyr_keys:
+                    level_mpp = root[pyr_key].attrs.asdict().get('mpp')
+                    if level_mpp is not None:
+                        img_chan.pyramid[float(level_mpp)] = da.from_zarr(root[pyr_key])
+            else:
+                img_chan.generate_pyramid()
+
+            sample.images[name] = img_chan
+
+    if verbose:
+        if summary_list:
+            print(f"  - Images available: {', '.join(summary_list)}")
+
+    if images_only:
+        if verbose:
+            print(f"  - Image channels loaded: {', '.join(sample.images.keys())}")
+            print(f"  (images_only=True — skipped omics, cells, ROIs)")
+        sample._already_saved = True
+        return sample
+
+    omics_dir = in_path / "omics"
+    if omics_dir.exists():
+        # Flat single-level channels (old format and single-level new saves)
+        for omic_path in omics_dir.glob("*.zarr"):
+            name = omic_path.stem
+            adata = ad.read_zarr(omic_path)
+            spatial_mat = np.array(adata.uns.get('spatial_meta', np.eye(3)))
+            spatial = SpatialMetadata(transform_matrix=spatial_mat)
+            channel_meta = adata.uns.get('channel_meta', {})
+            omic_chan = OmicChannel(name=name, data=adata, spatial_meta=spatial, metadata=channel_meta)
+            sample.omics[name] = omic_chan
+
+        # Pyramid channels: subdirectories containing {bin_um}um.zarr files
+        for chan_dir in omics_dir.iterdir():
+            if not chan_dir.is_dir() or chan_dir.suffix == '.zarr':
+                continue
+            def _parse_bin_um(p):
+                try:
+                    return float(p.stem.replace('um', ''))
+                except ValueError:
+                    return None
+            valid_files = [p for p in chan_dir.glob("*.zarr") if _parse_bin_um(p) is not None]
+            skipped = [p.name for p in chan_dir.glob("*.zarr") if _parse_bin_um(p) is None]
+            if skipped:
+                print(f"  [load_sample] Skipping unparseable zarr files in {chan_dir.name}/: {skipped}")
+            level_files = sorted(valid_files, key=_parse_bin_um)
+            if not level_files:
+                continue
+
+            pyramid: Dict[float, Any] = {}
+            spatial_mat = np.eye(3)
+            channel_meta: Dict[str, Any] = {}
+            for level_path in level_files:
+                bin_um = float(level_path.stem.replace('um', ''))
+                try:
+                    adata = ad.read_zarr(level_path)
+                except Exception as e:
+                    print(f"  [load_sample] WARNING: could not read {level_path.name} in {chan_dir.name}/ — skipping ({type(e).__name__}: {e})")
+                    continue
+                spatial_mat = np.array(adata.uns.get('spatial_meta', np.eye(3)))
+                channel_meta = adata.uns.get('channel_meta', {})
+                pyramid[bin_um] = adata
+
+            if not load_2um_bin and 2.0 in pyramid and 4.0 in pyramid:
+                del pyramid[2.0]
+
+            if not pyramid:
+                print(f"  [load_sample] WARNING: no valid zarr levels loaded for '{chan_dir.name}' — channel skipped.")
+                continue
+
+            name = chan_dir.name
+            finest_bin = sorted(pyramid.keys())[0]
+            # Keep bin_size_um in sync with the actual finest level in use —
+            # the stored value may be stale if 2µm was originally finest but was dropped.
+            # Skip for continuous point-cloud channels (Xenium) — they have no bin size
+            # and injecting bin_size_um would wrongly route them to the Visium spot renderer.
+            if (not channel_meta.get('is_continuous')
+                    and channel_meta.get('bin_size_um') != finest_bin):
+                channel_meta = {**channel_meta, 'bin_size_um': finest_bin}
+            spatial = SpatialMetadata(transform_matrix=spatial_mat)
+            omic_chan = OmicChannel(
+                name=name, data=pyramid[finest_bin],
+                spatial_meta=spatial, metadata=channel_meta,
+                pyramid=pyramid
+            )
+            sample.omics[name] = omic_chan
+
+    cells_dir = in_path / "cells"
+    if cells_dir.exists():
+        for cell_path in cells_dir.glob("*.zarr"):
+            name = cell_path.stem
+            adata = ad.read_zarr(cell_path)
+            spatial_mat = np.array(adata.uns.get('spatial_meta', np.eye(3)))
+            spatial = SpatialMetadata(transform_matrix=spatial_mat)
+            
+            # FIX: Restore the channel metadata
+            channel_meta = adata.uns.get('channel_meta', {})
+            
+            cell_chan = CellChannel(name=name, boundaries=adata, spatial_meta=spatial, metadata=channel_meta)
+            sample.cells[name] = cell_chan
+
+    if verbose:
+        print(f"  - Image channels loaded: {', '.join(sample.images.keys())}")
+        print(f"  - Omic channels loaded: {', '.join(sample.omics.keys())}")
+        print(f"  - Cell channels loaded: {', '.join(sample.cells.keys())}")
+        print(f"  - ROIs loaded: {', '.join(sample.rois.keys())}")
+
+    # Any sample returned by load_sample() came from disk — the save cell guard
+    # uses this flag to skip the re-save step when using the alternate entry point.
+    sample._already_saved = True
+
+    return sample
