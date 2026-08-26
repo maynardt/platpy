@@ -138,6 +138,15 @@ def build_spatial_block_index(adata, mpp, chunk_px=1024, gene_col=None):
 # surrounds the signal, mirroring the image side's own zero-pixel exclusion.
 _TRANSCRIPT_ALPHA_PCT_KEYS = [0.1, 1, 5, 25, 50, 95, 99, 100]
 
+# Genes with fewer than this many total counts skip the full percentile
+# computation -- checked 2026-08-26 against a real 549K-spot / 19K-gene whole-
+# transcriptome Visium HD sample: mean per-gene zero-fraction was 99.5%, and
+# 34% of genes had sum <= 100. Below this floor a gene's signal is either a
+# handful of genuinely high cells or noise scattered everywhere; neither case
+# is usefully described by a table of percentiles (per Tom). Cheap to tune
+# later -- doesn't force a version bump, see genes_reduced below.
+_TRANSCRIPT_ALPHA_MIN_SUM = 250
+
 
 def _percentile_row(values: np.ndarray) -> list:
     """
@@ -180,12 +189,24 @@ def build_transcript_alpha_table(adata, platform: str, bin_um: Optional[float] =
         full-slide thumbnail level, which would under-represent the contrast a
         user actually sees when zoomed in); required for this platform.
 
+    Genes with fewer than _TRANSCRIPT_ALPHA_MIN_SUM total counts skip the full
+    percentile computation entirely and get a cheap [max, sum] pair in
+    'genes_reduced' instead -- below that floor, a gene's signal is either a
+    handful of genuinely high cells or scattered noise, and neither case is
+    usefully described by a table of percentiles. This is also the actual
+    performance-critical path: the sort+percentile call is the expensive part
+    per gene, not computing a sum or max, so checking the (vectorized, cheap)
+    sum first avoids that cost for the ~30%+ of genes typically below floor in
+    real whole-transcriptome data.
+
     Returns a dict ready to be JSON-stringified into adata.uns['transcript_alpha']:
         {'bin_um': <the spatial bin size, in microns, the stats were computed
                     over -- histogram tile size for xenium, source spot-bin
                     level for visium (set by the caller for visium; None here)>,
+         'min_sum_threshold': _TRANSCRIPT_ALPHA_MIN_SUM,
          'genes': {gene: [p0.1, p1, p5, p25, p50, p95, p99, p100,
-                           first_nonzero_rank, sum], ...}}
+                           first_nonzero_rank, sum], ...},
+         'genes_reduced': {gene: [max, sum], ...}}
     Returns None if gene_col / expected data isn't present (nothing to build).
     """
     if platform == 'xenium':
@@ -203,22 +224,55 @@ def build_transcript_alpha_table(adata, platform: str, bin_um: Optional[float] =
         bin_id = by * n_bx + bx
         n_bins = n_bx * n_by
 
-        gene_table = {}
-        for gene in np.unique(genes_arr):
-            counts = np.bincount(bin_id[genes_arr == gene], minlength=n_bins)
-            gene_table[str(gene)] = _percentile_row(counts)
+        # Total transcript count per gene -- just a row count per gene, no
+        # binning needed -- so this cheap pre-filter costs nothing extra even
+        # though the histogram itself still needs building either way to get max.
+        unique_genes, gene_totals = np.unique(genes_arr, return_counts=True)
 
-        return {'bin_um': float(bin_um), 'genes': gene_table}
+        gene_table, genes_reduced = {}, {}
+        for gene, total in zip(unique_genes, gene_totals):
+            counts = np.bincount(bin_id[genes_arr == gene], minlength=n_bins)
+            if total < _TRANSCRIPT_ALPHA_MIN_SUM:
+                genes_reduced[str(gene)] = [float(counts.max()) if counts.size else 0.0, float(total)]
+            else:
+                gene_table[str(gene)] = _percentile_row(counts)
+
+        return {'bin_um': float(bin_um), 'min_sum_threshold': _TRANSCRIPT_ALPHA_MIN_SUM,
+                'genes': gene_table, 'genes_reduced': genes_reduced}
 
     else:  # visium (and other binned platforms with a genuine spot x gene matrix)
         if adata.n_vars == 0:
             return None
+        import scipy.sparse as sp
         X = adata.X
-        gene_table = {
-            str(gene): _percentile_row(np.asarray(X[:, i]).ravel())
-            for i, gene in enumerate(adata.var_names)
-        }
-        return {'bin_um': None, 'genes': gene_table}
+        if sp.issparse(X):
+            # CSC (not CSR) for fast column slicing -- CSR's column access is
+            # O(n_spots) per column regardless of sparsity, CSC's is O(nnz).
+            X = X.tocsc()
+        gene_sums = np.asarray(X.sum(axis=0)).ravel()
+
+        gene_table, genes_reduced = {}, {}
+        for i, gene in enumerate(adata.var_names):
+            col = X[:, i]
+            if gene_sums[i] < _TRANSCRIPT_ALPHA_MIN_SUM:
+                # Skip densifying the full column for low-signal genes -- just
+                # need the max, which sparse .data (nonzero entries only) gives
+                # directly without materializing all n_spots values.
+                if sp.issparse(col):
+                    col_max = float(col.data.max()) if col.nnz > 0 else 0.0
+                else:
+                    col_max = float(np.asarray(col).max()) if np.size(col) else 0.0
+                genes_reduced[str(gene)] = [col_max, float(gene_sums[i])]
+            else:
+                # adata.X is virtually always scipy sparse for real 10x/scanpy
+                # data -- np.asarray() does NOT densify a sparse column slice,
+                # it wraps the sparse object itself, corrupting everything
+                # downstream, so densify explicitly via .toarray() instead.
+                col = col.toarray().ravel() if sp.issparse(col) else np.asarray(col).ravel()
+                gene_table[str(gene)] = _percentile_row(col)
+
+        return {'bin_um': None, 'min_sum_threshold': _TRANSCRIPT_ALPHA_MIN_SUM,
+                'genes': gene_table, 'genes_reduced': genes_reduced}
 
 
 def _remove_readonly(func, path, exc):
