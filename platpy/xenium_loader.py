@@ -211,9 +211,11 @@ def load_xenium(x_dir: str | Path, name: str = "XeniumSample", load_boundaries: 
             if hasattr(thumb, 'compute'):
                 thumb = thumb.compute()
             flat = thumb[thumb > 0].flatten() if np.any(thumb > 0) else thumb.flatten()
+            source_mpp = max_mpp_key if channel.pyramid else channel.mpp
             channel.metadata['display_stats'] = {
                 'percentile_keys':   _PCT_KEYS,
                 'percentile_values': np.percentile(flat.astype(np.float32), _PCT_KEYS).tolist(),
+                'source_mpp':        float(source_mpp),
             }
 
             sample.images[base_name] = channel

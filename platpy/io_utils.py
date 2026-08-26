@@ -3,25 +3,35 @@ import logging
 import shutil
 import os
 import stat
-import warnings
 from pathlib import Path
 import numpy as np
 import pandas as pd
 import dask.array as da
 import zarr
 import anndata as ad
-import numcodecs
 from typing import Optional, Any, Dict
 
-# Zarr v3 warns when writing v2 format, but v2 is intentional here — it's more
-# compatible with our mixed dask/numpy data structures and the zarr_format=2 API.
-warnings.filterwarnings("ignore", message=".*zarr v2.*", category=UserWarning)
 
 # platpy imports
 from .channels import SampleSet, CellChannel, ImageChannel, OmicChannel, ROIChannel
 from .transform_utils import SpatialMetadata 
 
 logger = logging.getLogger(__name__)
+
+# anndata still defaults to writing zarr format 2 (its own default is changing in a
+# future release, independent of the zarr library's own default_zarr_format=3) —
+# set explicitly so omic/cell AnnData writes use zarr v3, matching the image side.
+ad.settings.zarr_write_format = 3
+
+# On-disk format version stamps (platpy_migration_plan.md Item 0). Independent
+# per-feature counters -- bumping one doesn't force a rebuild/reload of the
+# others, even where two currently happen to be built in the same function call.
+# Missing field on load = version 0 (pre-optimization), same graceful fallback
+# the presence-checks already use -- not a breaking change for older files.
+PLATPY_FORMAT_VERSION = 1
+OPT_BLOCK_INDEX_VERSION = 1
+OPT_NAME_OFFSET_VERSION = 1
+OPT_TRANSCRIPT_ALPHA_VERSION = 1
 
 
 def build_spatial_block_index(adata, mpp, chunk_px=1024, gene_col=None):
@@ -85,7 +95,7 @@ def build_spatial_block_index(adata, mpp, chunk_px=1024, gene_col=None):
         for k in range(len(starts))
     ]
 
-    # Add coarse first-letter gene index within each block (Xenium only — gene_col must be set).
+    # Add coarse gene name-prefix index within each block (Xenium only — gene_col must be set).
     # Genes are already sorted alphabetically within each block, so searchsorted finds boundaries
     # in O(log n) at query time with zero extra storage overhead beyond these small per-block dicts.
     if gene_col is not None:
@@ -93,7 +103,7 @@ def build_spatial_block_index(adata, mpp, chunk_px=1024, gene_col=None):
         for b in blocks:
             genes = gene_vals[b['row_start']:b['row_end']]
             letters = sorted(set(g[0].upper() for g in genes if g))
-            b['letter_offsets'] = {
+            b['name_offsets'] = {
                 letter: (
                     int(np.searchsorted(genes, letter)),
                     int(np.searchsorted(genes, chr(ord(letter) + 1), 'left'))
@@ -110,7 +120,105 @@ def build_spatial_block_index(adata, mpp, chunk_px=1024, gene_col=None):
         'chunk_px':      int(chunk_px),
         'blocks':        blocks,
     })
+    # Independent version counters (see PLATPY_FORMAT_VERSION block above) — kept as
+    # separate uns keys rather than nested inside block_index's own JSON blob, even
+    # though both features are built right here, so each can be bumped/tested on its
+    # own without disturbing the other.
+    adata_sorted.uns['opt_block_index_version'] = OPT_BLOCK_INDEX_VERSION
+    if gene_col is not None:
+        adata_sorted.uns['opt_name_offset_version'] = OPT_NAME_OFFSET_VERSION
     return adata_sorted
+
+
+# Percentile ticks for the transcript_alpha table. Coarser than the image side's
+# 16-point display_stats (which is one array total per image) since this multiplies
+# per-gene and panels can run to thousands of genes. Zeros are dropped before
+# computing percentiles -- this is a *display* table, not an analysis statistic,
+# so dynamic range shouldn't depend on how much non-expressing "blank space"
+# surrounds the signal, mirroring the image side's own zero-pixel exclusion.
+_TRANSCRIPT_ALPHA_PCT_KEYS = [0.1, 1, 5, 25, 50, 95, 99, 100]
+
+
+def _percentile_row(values: np.ndarray) -> list:
+    """
+    Shared tail of the transcript_alpha per-gene stat row: 8 percentiles computed
+    over nonzero values only, + rank of the first nonzero entry in the full
+    ascending-sorted array (zeros included -- a cheap zero-fraction proxy), + sum
+    of all values (not derivable from the percentiles, and the most commonly
+    needed downstream statistic e.g. for total-count normalization).
+    """
+    values = np.sort(values)
+    first_nonzero_rank = int(np.searchsorted(values, 1))
+    nonzero = values[first_nonzero_rank:]
+    pct_source = nonzero if len(nonzero) > 0 else values
+    percentiles = np.percentile(pct_source, _TRANSCRIPT_ALPHA_PCT_KEYS).tolist()
+    return percentiles + [first_nonzero_rank, float(values.sum())]
+
+
+def build_transcript_alpha_table(adata, platform: str, bin_um: Optional[float] = None,
+                                  gene_col: str = 'feature'):
+    """
+    Precompute a small per-gene percentile table for fast display/contrast
+    scaling of rendered gene density -- the omic-side analog of the image
+    `display_stats` pattern (see xenium_loader.py / visium_loader.py).
+
+    Dispatches on platform:
+      - visium (binned, has a genuine spot x gene count matrix already): computes
+        directly from each gene's column in adata.X, one value per spot -- no
+        spatial re-binning needed, spots are already the natural unit. Callers
+        should pass a single reference pyramid level's adata (not run this once
+        per level) and reuse the resulting table across all saved levels, so the
+        reference stats aren't individually noisy at each resolution -- see
+        save_sample()'s omic loop, which also stamps the actual spot-bin level
+        used into the returned dict's 'bin_um' field after calling this.
+      - xenium (continuous point cloud, one row per detected transcript, no
+        per-row "expression value" to take a percentile of): builds a per-gene
+        spatial histogram (transcript count per bin_um x bin_um tile) first --
+        a cheap "pseudo-render" -- and computes percentiles over that instead.
+        bin_um should roughly match a realistic interactive-viewing resolution
+        (e.g. the paired image channel's second-coarsest pyramid level, not the
+        full-slide thumbnail level, which would under-represent the contrast a
+        user actually sees when zoomed in); required for this platform.
+
+    Returns a dict ready to be JSON-stringified into adata.uns['transcript_alpha']:
+        {'bin_um': <the spatial bin size, in microns, the stats were computed
+                    over -- histogram tile size for xenium, source spot-bin
+                    level for visium (set by the caller for visium; None here)>,
+         'genes': {gene: [p0.1, p1, p5, p25, p50, p95, p99, p100,
+                           first_nonzero_rank, sum], ...}}
+    Returns None if gene_col / expected data isn't present (nothing to build).
+    """
+    if platform == 'xenium':
+        if gene_col not in adata.obs.columns or 'spatial' not in adata.obsm:
+            return None
+        if bin_um is None:
+            raise ValueError("bin_um is required to build transcript_alpha for a xenium channel")
+
+        coords = adata.obsm['spatial']
+        genes_arr = np.asarray(adata.obs[gene_col].values)
+        min_x, min_y = coords[:, 0].min(), coords[:, 1].min()
+        bx = np.floor((coords[:, 0] - min_x) / bin_um).astype(int)
+        by = np.floor((coords[:, 1] - min_y) / bin_um).astype(int)
+        n_bx, n_by = int(bx.max()) + 1, int(by.max()) + 1
+        bin_id = by * n_bx + bx
+        n_bins = n_bx * n_by
+
+        gene_table = {}
+        for gene in np.unique(genes_arr):
+            counts = np.bincount(bin_id[genes_arr == gene], minlength=n_bins)
+            gene_table[str(gene)] = _percentile_row(counts)
+
+        return {'bin_um': float(bin_um), 'genes': gene_table}
+
+    else:  # visium (and other binned platforms with a genuine spot x gene matrix)
+        if adata.n_vars == 0:
+            return None
+        X = adata.X
+        gene_table = {
+            str(gene): _percentile_row(np.asarray(X[:, i]).ravel())
+            for i, gene in enumerate(adata.var_names)
+        }
+        return {'bin_um': None, 'genes': gene_table}
 
 
 def _remove_readonly(func, path, exc):
@@ -165,6 +273,30 @@ def _sanitize_for_zarr(obj: Any) -> Any:
 ## including metadta and ROIs.
 ################################
 
+def _derive_transcript_alpha_bin_um(sample: SampleSet, omic_chan: OmicChannel) -> float:
+    """
+    Picks a spatial bin size for transcript_alpha's Xenium pseudo-render
+    histogram: the second-coarsest level of an image channel's pyramid in the
+    same sample (any one -- they're registered to the same coordinate system,
+    so which specific channel doesn't matter). Deliberately not the coarsest
+    (thumbnail) level, which would cover far more area per bin than a realistic
+    interactive-viewing resolution and under-represent the contrast a user
+    actually sees when zoomed in.
+
+    Falls back to the same spatial block size build_spatial_block_index()
+    already uses (chunk_px x mpp) if no image is present, or its pyramid has
+    fewer than 2 levels (e.g. generate_pyramid() was never called).
+    """
+    for img_chan in sample.images.values():
+        levels = sorted(img_chan.pyramid.keys())
+        if len(levels) >= 2:
+            return levels[-2]
+        elif levels:
+            return levels[-1]
+    mpp = float(omic_chan.spatial_meta.transform_matrix[0, 0])
+    return 1024 * mpp
+
+
 def save_sample(
     sample: SampleSet,
     out_prefix: str,
@@ -192,8 +324,7 @@ def save_sample(
     out_path.mkdir(parents=True, exist_ok=True)
     logger.info(f"Saving platpy Sample '{sample.name}' to {out_path}")
 
-    # Force zarr v2 format throughout — consistent, portable, avoids v3 codec mismatches.
-    compressor = numcodecs.Blosc(cname='lz4', clevel=clevel, shuffle=numcodecs.Blosc.BITSHUFFLE)
+    compressors = [zarr.codecs.BloscCodec(cname='lz4', clevel=clevel, shuffle=zarr.codecs.BloscShuffle.bitshuffle)]
 
     # ========
     # 1. Save Images (morph.zarr)
@@ -215,7 +346,7 @@ def save_sample(
             chunks = (1024, 1024, 3) if img_data.ndim == 3 else (1024, 1024)
             z = root.require_dataset(
                 name, shape=img_data.shape, chunks=chunks,
-                dtype=img_data.dtype, overwrite=True, compressor=compressor
+                dtype=img_data.dtype, overwrite=True, compressors=compressors
             )
             if isinstance(img_data, da.Array):
                 da.store(img_data, z)
@@ -246,7 +377,7 @@ def save_sample(
                 pyr_chunks = (1024, 1024, 3) if level_arr.ndim == 3 else (1024, 1024)
                 zp = root.require_dataset(
                     pyr_key, shape=level_arr.shape, chunks=pyr_chunks,
-                    dtype=level_arr.dtype, overwrite=True, compressor=compressor
+                    dtype=level_arr.dtype, overwrite=True, compressors=compressors
                 )
                 if isinstance(level_arr, da.Array):
                     da.store(level_arr, zp)
@@ -279,12 +410,40 @@ def save_sample(
 
             spatial_list = np.array(omic_chan.spatial_meta.transform_matrix).tolist()
             channel_meta = _sanitize_for_zarr(omic_chan.metadata)
+            platform = omic_chan.metadata.get('platform', 'visium')
+            alpha_bin_um = _derive_transcript_alpha_bin_um(sample, omic_chan) if platform == 'xenium' else None
+
+            # Compute transcript_alpha ONCE from a single reference level, not once per
+            # pyramid level -- otherwise each resolution's table would be individually
+            # noisy (Visium's 4um bins in particular). Mirrors the image side's own
+            # choice to compute display_stats from one smooth thumbnail regardless of
+            # render resolution. For Visium: second-coarsest kept bin level (same
+            # "not the single coarsest option" principle as the Xenium bin_um choice
+            # above -- coarsest available today is 16um, so this lands on 8um).
+            # For Xenium there's only ever one pyramid entry (the 0.0 flag) anyway.
+            alpha_table = None
+            if omic_chan.pyramid:
+                levels_sorted = sorted(omic_chan.pyramid.keys())
+                ref_level = levels_sorted[0] if platform == 'xenium' else (
+                    levels_sorted[-2] if len(levels_sorted) >= 2 else levels_sorted[-1]
+                )
+                ref_adata = omic_chan.pyramid[ref_level]
+                if isinstance(ref_adata, pd.DataFrame):
+                    ref_adata = ad.AnnData(obs=ref_adata)
+                alpha_table = build_transcript_alpha_table(ref_adata, platform, bin_um=alpha_bin_um)
+                if platform != 'xenium' and alpha_table is not None:
+                    alpha_table['bin_um'] = float(ref_level)  # which spot-bin level was used
 
             for bin_um, adata_level in omic_chan.pyramid.items():
                 if isinstance(adata_level, pd.DataFrame):
                     adata_level = ad.AnnData(obs=adata_level)
                 adata_level.uns['spatial_meta'] = spatial_list
                 adata_level.uns['channel_meta'] = channel_meta
+
+                if alpha_table is not None:
+                    adata_level.uns['transcript_alpha'] = json.dumps(alpha_table)
+                    adata_level.uns['opt_transcript_alpha_version'] = OPT_TRANSCRIPT_ALPHA_VERSION
+
                 dest_path = chan_dir / f"{float(bin_um):.1f}um.zarr"
                 adata_level.write_zarr(dest_path)
 
@@ -321,6 +480,7 @@ def save_sample(
     meta_path = out_path / "sample_meta.json"
     sample_info = {
         'name': sample.name,
+        'platpy_format_version': PLATPY_FORMAT_VERSION,
         'metadata': sample.metadata,
         'rois': {}
     }

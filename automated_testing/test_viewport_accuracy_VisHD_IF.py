@@ -1,14 +1,19 @@
+import sys
 import numpy as np
 import pandas as pd
 import cv2
 import time
+
+# Windows console default codepage can't encode some unicode chars used below (e.g. ≥)
+if sys.stdout.encoding and sys.stdout.encoding.lower() != 'utf-8':
+    sys.stdout.reconfigure(encoding='utf-8')
 from scipy.spatial import KDTree
 from typing import Dict, List, Tuple
 
 # platpy imports
-from channels.image_channel import ImageChannel
-from transform_utils import SpatialMetadata, create_transform_matrix
-from viewport import ViewPort
+from platpy.channels.image_channel import ImageChannel
+from platpy.transform_utils import SpatialMetadata, create_transform_matrix
+from platpy.viewport import ViewPort
 
 
 # =============================================================================
@@ -207,7 +212,7 @@ def run_scale_sweep(
 
     if len(df) > 0:
         summary_rows = []
-        for sf_bin, grp in df.groupby(pd.cut(df['scale_fraction'], bins=breakpoints)):
+        for sf_bin, grp in df.groupby(pd.cut(df['scale_fraction'], bins=breakpoints), observed=False):
             if len(grp) == 0:
                 continue
             summary_rows.append({

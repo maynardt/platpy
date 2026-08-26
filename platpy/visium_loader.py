@@ -317,6 +317,7 @@ def add_visium_fullres_channel(sample: SampleSet, path: str, name: str, mpp: flo
             'percentile_values': np.percentile(flat, _PCT_KEYS).tolist(),
             'n_samples': int(len(flat)),
             'dtype': str(img_array.dtype),
+            'source_mpp': float(mpp * step),
         }
         if debug: print(f"  → Computed display stats ({len(flat):,} samples, step={step})")
 

@@ -33,6 +33,10 @@ platpy_data/
 *.zip
 *.h5ad
 
+# automated_testing/*.py run outputs
+/viewport_*.csv
+/viewport_*.png
+
 # OS
 .DS_Store
 Thumbs.db
