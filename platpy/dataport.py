@@ -290,6 +290,13 @@ class DataPort:
         this to map any analysis result (e.g. CellPose cell centroids) back to
         the global coordinate system without any extra bookkeeping.
 
+        Tiling itself is only partially implemented: the DataPort can break the
+        ROI up into tiles and hand each one to your function, but stitching the
+        return values back together (merging/deduplicating results across tile
+        boundaries) has not been implemented yet -- that's a future goal. Every
+        call warns for this reason; see overlap_um below for the sharpest case
+        of why that matters.
+
         Args:
             channel:        The ImageChannel to tile.
             tile_size_um:   Edge length of each tile in microns.
@@ -297,26 +304,24 @@ class DataPort:
                             side, so the function you pass to process() sees
                             context beyond the tile's exact grid boundary (e.g.
                             so a segmentation model doesn't cut cells off at the
-                            edge). NOT a full tiling solution: nothing here
-                            merges or deduplicates results across tiles, so an
-                            object whose centroid falls in the overlap region
-                            between two tiles will be detected independently by
-                            each -- reconciling that is on the caller.
+                            edge). Since nothing merges or deduplicates results
+                            across tiles (see above), an object whose centroid
+                            falls in the overlap region between two tiles will
+                            be detected independently by each and appear twice.
             downsample_mpp: Optional explicit target resolution in microns/pixel,
                             applied to each tile individually. Same meaning as
                             extract()'s downsample_mpp -- None = native resolution.
         """
         import dask.array as da
 
-        if overlap_um > 0:
-            warnings.warn(
-                "tiles()/process() with overlap_um > 0 pads each tile's crop for "
-                "context, but does not merge or deduplicate results across tiles "
-                "-- an object detected in the overlap region between two tiles "
-                "will appear in both tiles' results. Reconciling that is on the "
-                "caller; it is not done automatically.",
-                UserWarning, stacklevel=2
-            )
+        warnings.warn(
+            "DataPort analysis has used tiling (tile_size_um set), but results "
+            "have not been stitched or deduplicated -- an object spanning a "
+            "tile boundary, or falling in an overlap_um region, may appear "
+            "more than once across tiles' results. Reconciling that is on the "
+            "caller; DataPort does not do it automatically yet.",
+            UserWarning, stacklevel=2
+        )
 
         min_x, max_x, min_y, max_y = self.roi_extent
         x = min_x
@@ -420,6 +425,12 @@ class DataPort:
         If tile_size_um is None, the full ROI is extracted and fn is called once.
         If tile_size_um is set, fn is called on each tile independently.
 
+        Tiling is partially implemented here: the DataPort can break the ROI up
+        into tiles and hand each one to fn, but stitching the return values back
+        together (merging/deduplicating results across tile boundaries) has not
+        been implemented yet -- that's a future goal. Using tile_size_um always
+        warns for this reason.
+
         Args:
             channel:        The ImageChannel to extract from.
             fn:             Any callable: fn(array, **fn_kwargs) -> result
@@ -429,8 +440,7 @@ class DataPort:
                             every side (see tiles()'s docstring) -- does NOT merge
                             or deduplicate results across tiles; an object in the
                             overlap between two tiles will appear in both tiles'
-                            results. Warns if > 0, since that reconciliation is on
-                            the caller and easy to assume is handled automatically.
+                            results.
             downsample_mpp: Optional target resolution in µm/px, passed to extract()
                             (tile_size_um=None) or to tiles() (tile_size_um set) --
                             applies identically either way, one tile at a time when
