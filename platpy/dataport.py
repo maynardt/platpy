@@ -2,6 +2,7 @@
 import numpy as np
 from typing import Tuple, Optional, Callable, Generator, Dict, Union
 import copy
+import warnings
 
 from .channels.image_channel import ImageChannel
 from .channels.omic_channel import OmicChannel
@@ -292,13 +293,30 @@ class DataPort:
         Args:
             channel:        The ImageChannel to tile.
             tile_size_um:   Edge length of each tile in microns.
-            overlap_um:     Overlap between adjacent tiles in microns.
-                            Useful when stitching results that need context at edges.
+            overlap_um:     Pads each tile's crop by this many microns on every
+                            side, so the function you pass to process() sees
+                            context beyond the tile's exact grid boundary (e.g.
+                            so a segmentation model doesn't cut cells off at the
+                            edge). NOT a full tiling solution: nothing here
+                            merges or deduplicates results across tiles, so an
+                            object whose centroid falls in the overlap region
+                            between two tiles will be detected independently by
+                            each -- reconciling that is on the caller.
             downsample_mpp: Optional explicit target resolution in microns/pixel,
                             applied to each tile individually. Same meaning as
                             extract()'s downsample_mpp -- None = native resolution.
         """
         import dask.array as da
+
+        if overlap_um > 0:
+            warnings.warn(
+                "tiles()/process() with overlap_um > 0 pads each tile's crop for "
+                "context, but does not merge or deduplicate results across tiles "
+                "-- an object detected in the overlap region between two tiles "
+                "will appear in both tiles' results. Reconciling that is on the "
+                "caller; it is not done automatically.",
+                UserWarning, stacklevel=2
+            )
 
         min_x, max_x, min_y, max_y = self.roi_extent
         x = min_x
@@ -407,7 +425,12 @@ class DataPort:
             fn:             Any callable: fn(array, **fn_kwargs) -> result
                             e.g. model.eval, a custom segmenter, a lambda.
             tile_size_um:   Optional tile size in microns. None = whole ROI at once.
-            overlap_um:     Tile overlap in microns for stitching-aware functions.
+            overlap_um:     Pads each tile's crop with this much extra context on
+                            every side (see tiles()'s docstring) -- does NOT merge
+                            or deduplicate results across tiles; an object in the
+                            overlap between two tiles will appear in both tiles'
+                            results. Warns if > 0, since that reconciliation is on
+                            the caller and easy to assume is handled automatically.
             downsample_mpp: Optional target resolution in µm/px, passed to extract()
                             (tile_size_um=None) or to tiles() (tile_size_um set) --
                             applies identically either way, one tile at a time when
