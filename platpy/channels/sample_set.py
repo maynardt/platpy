@@ -1,5 +1,6 @@
 from dataclasses import dataclass, field
 from typing import Dict, Any, Tuple, Optional
+import pandas as pd
 
 from .image_channel import ImageChannel
 from .omic_channel import OmicChannel
@@ -39,7 +40,8 @@ class SampleSet:
         max_x_um: float,
         min_y_um: float,
         max_y_um: float,
-        new_name: Optional[str] = None
+        new_name: Optional[str] = None,
+        cell_margin_um: float = 100.0
     ) -> 'SampleSet':
         """
         Extract a spatial sub-region as a new SampleSet.
@@ -49,12 +51,24 @@ class SampleSet:
         coordinate frame. Transcript/omic DataFrames are filtered by x/y.
         AnnData omics are filtered by obsm['spatial'].
 
+        Cell boundary polygons are kept whole-or-nothing per cell (never split
+        a single cell's vertices across the ROI edge), and cell_margin_um
+        expands the boundary test beyond the strict ROI so cells whose
+        centroid sits just outside it but whose body still overlaps aren't
+        silently dropped — the same edge problem DataPort's buffer_um solves
+        for spatial-block queries.
+
         The returned SampleSet can be saved and reloaded independently with
         save_sample() / load_sample().
 
         Args:
             min_x_um, max_x_um, min_y_um, max_y_um: ROI bounds in microns.
             new_name: Name for the extracted SampleSet. Defaults to self.name + '_roi'.
+            cell_margin_um: Margin (microns) added around the ROI when deciding
+                whether a cell's boundary polygon overlaps it. Default 100µm
+                (~a few cell diameters) — this is a space-saving filter, not a
+                precise clip, so a generous margin costs little and avoids
+                losing edge cells.
         """
         out = SampleSet(name=new_name or f"{self.name}_roi")
         out.screen_width  = self.screen_width
@@ -105,7 +119,35 @@ class SampleSet:
                     pyramid={k: v[mask] for k, v in omic.pyramid.items()}
                 )
 
-        out.cells = dict(self.cells)
+        margin_min_x, margin_max_x = min_x_um - cell_margin_um, max_x_um + cell_margin_um
+        margin_min_y, margin_max_y = min_y_um - cell_margin_um, max_y_um + cell_margin_um
+
+        out.cells = {}
+        for cell_name, cell_chan in self.cells.items():
+            b = cell_chan.boundaries
+            if isinstance(b, pd.DataFrame) and {'cell_id', 'x', 'y'}.issubset(b.columns):
+                # Boundaries are one row per polygon *vertex* -- filter by whole
+                # cell_id, not by row, or a kept cell's polygon would be
+                # silently mangled (only the vertices that happened to fall
+                # inside the box, rather than its true shape).
+                vertex_in_margin = (
+                    (b['x'] >= margin_min_x) & (b['x'] <= margin_max_x) &
+                    (b['y'] >= margin_min_y) & (b['y'] <= margin_max_y)
+                )
+                keep_ids = b.loc[vertex_in_margin, 'cell_id'].unique()
+                out.cells[cell_name] = CellChannel(
+                    name=cell_chan.name,
+                    data=cell_chan.data,
+                    boundaries=b[b['cell_id'].isin(keep_ids)].copy(),
+                    spatial_meta=cell_chan.spatial_meta,
+                    metadata=cell_chan.metadata.copy()
+                )
+            else:
+                # Unrecognized boundary shape (no cell_id/x/y columns) -- can't
+                # safely margin-filter without knowing the schema, so keep the
+                # channel as-is rather than silently dropping or corrupting it.
+                out.cells[cell_name] = cell_chan
+
         out.rois  = dict(self.rois)
         return out
 
