@@ -116,6 +116,24 @@ class DataPort:
     # IMAGE EXTRACTION
     # =========================================================================
 
+    @staticmethod
+    def _downsample_if_requested(arr: np.ndarray, native_mpp: float,
+                                  downsample_mpp: Optional[float]) -> np.ndarray:
+        """
+        Shared resize step for extract() and tiles(): if downsample_mpp asks for
+        a coarser resolution than the crop's native mpp, resize down to match.
+        No-op if downsample_mpp is None or not actually coarser than native.
+        """
+        if downsample_mpp is None:
+            return arr
+        if downsample_mpp <= native_mpp:
+            return arr
+        import cv2
+        scale = native_mpp / downsample_mpp
+        new_w = max(1, int(arr.shape[1] * scale))
+        new_h = max(1, int(arr.shape[0] * scale))
+        return cv2.resize(arr, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
     def extract(self, channel: ImageChannel,
                 downsample_mpp: Optional[float] = None) -> np.ndarray:
         """
@@ -128,7 +146,6 @@ class DataPort:
                             Only use when downsampling is deliberate (e.g. to match
                             a model's expected input). Default None = native resolution.
         """
-        import cv2
         import dask.array as da
 
         min_x, max_x, min_y, max_y = self.roi_extent
@@ -138,13 +155,8 @@ class DataPort:
         )
         arr = cropped.image.compute() if isinstance(cropped.image, da.Array) else cropped.image
 
-        if downsample_mpp is not None:
-            native_mpp = abs(float(cropped.spatial_meta.transform_matrix[0, 0]))
-            if downsample_mpp > native_mpp:
-                scale = native_mpp / downsample_mpp
-                new_w = max(1, int(arr.shape[1] * scale))
-                new_h = max(1, int(arr.shape[0] * scale))
-                arr = cv2.resize(arr, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        native_mpp = abs(float(cropped.spatial_meta.transform_matrix[0, 0]))
+        arr = self._downsample_if_requested(arr, native_mpp, downsample_mpp)
 
         return arr
 
@@ -268,7 +280,8 @@ class DataPort:
 
     def tiles(self, channel: ImageChannel,
               tile_size_um: float,
-              overlap_um: float = 0.0) -> Generator:
+              overlap_um: float = 0.0,
+              downsample_mpp: Optional[float] = None) -> Generator:
         """
         Generator: yields (tile_extent, tile_array) covering the full ROI.
 
@@ -277,10 +290,13 @@ class DataPort:
         the global coordinate system without any extra bookkeeping.
 
         Args:
-            channel:      The ImageChannel to tile.
-            tile_size_um: Edge length of each tile in microns.
-            overlap_um:   Overlap between adjacent tiles in microns.
-                          Useful when stitching results that need context at edges.
+            channel:        The ImageChannel to tile.
+            tile_size_um:   Edge length of each tile in microns.
+            overlap_um:     Overlap between adjacent tiles in microns.
+                            Useful when stitching results that need context at edges.
+            downsample_mpp: Optional explicit target resolution in microns/pixel,
+                            applied to each tile individually. Same meaning as
+                            extract()'s downsample_mpp -- None = native resolution.
         """
         import dask.array as da
 
@@ -299,6 +315,8 @@ class DataPort:
                         min_y_um=extent[2], max_y_um=extent[3]
                     )
                     arr = cropped.image.compute() if isinstance(cropped.image, da.Array) else cropped.image
+                    native_mpp = abs(float(cropped.spatial_meta.transform_matrix[0, 0]))
+                    arr = self._downsample_if_requested(arr, native_mpp, downsample_mpp)
                     yield extent, arr
                 except ValueError:
                     pass  # tile outside image bounds — skip silently
@@ -390,9 +408,12 @@ class DataPort:
                             e.g. model.eval, a custom segmenter, a lambda.
             tile_size_um:   Optional tile size in microns. None = whole ROI at once.
             overlap_um:     Tile overlap in microns for stitching-aware functions.
-            downsample_mpp: Optional target resolution in µm/px passed to extract().
-                            Useful when the analysis function expects a specific pixel scale
-                            (e.g. Cellpose works best at ~0.5 µm/px for tissue sections).
+            downsample_mpp: Optional target resolution in µm/px, passed to extract()
+                            (tile_size_um=None) or to tiles() (tile_size_um set) --
+                            applies identically either way, one tile at a time when
+                            tiling. Useful when the analysis function expects a
+                            specific pixel scale (e.g. Cellpose works best at
+                            ~0.5 µm/px for tissue sections).
             **fn_kwargs:    Passed straight through to fn unchanged.
 
         Returns:
@@ -406,7 +427,8 @@ class DataPort:
             arr = self.extract(channel, downsample_mpp=downsample_mpp)
             results.append((self.roi_extent, fn(arr, **fn_kwargs)))
         else:
-            for tile_extent, tile_arr in self.tiles(channel, tile_size_um, overlap_um):
+            for tile_extent, tile_arr in self.tiles(channel, tile_size_um, overlap_um,
+                                                      downsample_mpp=downsample_mpp):
                 results.append((tile_extent, fn(tile_arr, **fn_kwargs)))
 
         return results
