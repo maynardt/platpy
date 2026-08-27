@@ -427,7 +427,7 @@ def build_contour_shells(polygon, n_shells, step_um=None):
 
     shells = []
     outer = poly_sh
-    for _ in range(n_shells):
+    for _ in range(n_shells - 1):
         inner = outer.buffer(-step_um)
         if inner.is_empty:
             break
@@ -786,6 +786,9 @@ def bin_expression_matrix(adata, markers, bin_col='bin', bin_keys=None):
     -------
     expr     : np.ndarray [n_bins, n_markers]  — mean transcripts per cell
     bin_keys : list of str — bin labels in row order
+    markers  : list of str — the marker subset actually used (absent genes
+               dropped), in column order matching expr. Use this, not the
+               original input list, for labeling expr's columns.
     """
     if bin_keys is None:
         all_keys = [k for k in adata.obs[bin_col].unique()
@@ -801,4 +804,4 @@ def bin_expression_matrix(adata, markers, bin_col='bin', bin_keys=None):
         cells = adata[adata.obs[bin_col] == key]
         if cells.n_obs > 0:
             expr[i] = np.asarray(cells[:, markers].X.mean(axis=0)).flatten()
-    return expr, bin_keys
+    return expr, bin_keys, markers

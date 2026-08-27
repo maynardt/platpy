@@ -34,7 +34,7 @@ class FineAlignment:
     origin_um:            tuple       # (y0, x0) of the top-left grid corner in microns
     resolution_um:        float       # µm per grid cell
     method:               str   = 'pixel'  # 'pixel' = density-map alignment; future: 'tps'
-    max_displacement_um:  float = 0.0      # 95th-percentile displacement magnitude across the field
+    p95_displacement_um:  float = 0.0      # 95th-percentile displacement magnitude across the field
 
 
 # =============================================================================
@@ -385,7 +385,7 @@ def compute_fine_alignment(
         field_dy_um, field_dx_um = fit_displacement_field(block_shifts, density_grid.shape, resolution_um)
 
     magnitudes = np.sqrt(field_dy_um**2 + field_dx_um**2)
-    max_disp_um = float(np.percentile(magnitudes, 95))
+    p95_disp_um = float(np.percentile(magnitudes, 95))
 
     fa = FineAlignment(
         field_dy_um=field_dy_um,
@@ -393,11 +393,11 @@ def compute_fine_alignment(
         origin_um=origin_um,
         resolution_um=resolution_um,
         method=method,
-        max_displacement_um=max_disp_um
+        p95_displacement_um=p95_disp_um
     )
 
     sample.metadata['fine_spatial'] = fa
-    print(f"[fine align] Done. max_displacement_um={max_disp_um:.2f} µm. Stored in sample.metadata['fine_spatial'].")
+    print(f"[fine align] Done. p95_displacement_um={p95_disp_um:.2f} µm. Stored in sample.metadata['fine_spatial'].")
     return fa
 
 

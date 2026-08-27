@@ -77,7 +77,7 @@ class OmicChannel(BaseChannel):
                     return self.data.obsm['spatial_fine']
                 # True: skip fine alignment only when correction is sub-pixel
                 if (mpp > 0 and self.fine_alignment is not None
-                        and self.fine_alignment.max_displacement_um < mpp * 0.5):
+                        and self.fine_alignment.p95_displacement_um < mpp * 0.5):
                     return self.data.obsm['spatial']
                 return self.data.obsm['spatial_fine']
             return self.data.obsm['spatial']

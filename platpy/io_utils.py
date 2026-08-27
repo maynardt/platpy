@@ -143,7 +143,7 @@ _TRANSCRIPT_ALPHA_PCT_KEYS = [0.1, 1, 5, 25, 50, 95, 99, 100]
 # transcriptome Visium HD sample: mean per-gene zero-fraction was 99.5%, and
 # 34% of genes had sum <= 100. Below this floor a gene's signal is either a
 # handful of genuinely high cells or noise scattered everywhere; neither case
-# is usefully described by a table of percentiles (per Tom). Cheap to tune
+# is usefully described by a table of percentiles. Cheap to tune
 # later -- doesn't force a version bump, see genes_reduced below.
 _TRANSCRIPT_ALPHA_MIN_SUM = 250
 

@@ -7,12 +7,12 @@ name = "platpy"
 version = "0.1.0"
 description = "Pipeline for Layered Analysis of Transcriptomics"
 readme = "README.md"
-license = { file = "LICENSE" }
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.9"
 keywords = ["spatial transcriptomics", "spatial genomics", "Visium", "Xenium", "bioinformatics"]
 classifiers = [
     "Programming Language :: Python :: 3",
-    "License :: OSI Approved :: MIT License",
     "Topic :: Scientific/Engineering :: Bio-Informatics",
 ]
 

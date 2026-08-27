@@ -76,10 +76,15 @@ class SampleSet:
 
         for ch_name, chan in self.images.items():
             try:
-                out.images[ch_name] = chan.crop_to_micron_roi(
+                cropped = chan.crop_to_micron_roi(
                     min_x_um=min_x_um, max_x_um=max_x_um,
                     min_y_um=min_y_um, max_y_um=max_y_um
                 )
+                # crop_to_micron_roi() appends a '_crop' suffix to the channel's own
+                # .name, meant for transient render-time crops. Here the result is a
+                # permanent SampleSet image, so keep its identity matching the dict key.
+                cropped.name = ch_name
+                out.images[ch_name] = cropped
             except ValueError:
                 pass  # channel doesn't overlap this ROI — skip silently
 

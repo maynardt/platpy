@@ -42,6 +42,16 @@ For interactive ROI drawing:
 pip install napari
 ```
 
+**Intel Mac:** `llvmlite` (a transitive dependency via scanpy → umap-learn → numba) no longer ships
+prebuilt wheels for Intel Macs in recent releases, which causes a source build that fails without
+LLVM/cmake installed. Work around it by installing `numba` from conda-forge before installing
+platpy:
+
+```bash
+conda install -c conda-forge numba
+pip install platpy
+```
+
 ---
 
 ## Quick Start
