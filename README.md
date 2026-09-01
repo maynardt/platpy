@@ -88,7 +88,7 @@ Step-by-step vignettes are in the [`vignettes/`](vignettes/) directory:
 | [06 — Spatial analysis tools](vignettes/Vignette_06_.spatial_analysis_tools.ipynb) | Depth bins, contour shells, cortex unfolding |
 | [07 — Fine alignment](vignettes/Vignette_07_fine_alignment.ipynb) | Sub-micron IF-to-transcript registration |
 
-Sample datasets for all vignettes are downloaded automatically on first run from Zenodo (https://doi.org/10.5281/zenodo.20320692).
+Sample datasets for all vignettes are downloaded automatically on first run from Zenodo (https://doi.org/10.5281/zenodo.20320691 — this is the concept DOI and always resolves to the latest version of the dataset).
 
 ---
 
@@ -96,7 +96,7 @@ Sample datasets for all vignettes are downloaded automatically on first run from
 
 If you use platpy in your research, please cite:
 
-> Maynard, T. (2026). platpy: Pipeline for Layered Analysis of Transcriptomics. *bioRxiv*. [link to follow]
+> Maynard, T. (2026). platpy: Pipeline for Layered Analysis of Transcriptomics. *bioRxiv*. https://doi.org/10.64898/2026.05.26.727917
 
 ---
 
