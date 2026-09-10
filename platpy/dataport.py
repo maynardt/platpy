@@ -135,6 +135,33 @@ class DataPort:
         new_h = max(1, int(arr.shape[0] * scale))
         return cv2.resize(arr, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
+    def _crop_and_downsample(self, channel: ImageChannel, min_x: float, max_x: float,
+                              min_y: float, max_y: float,
+                              downsample_mpp: Optional[float]) -> Tuple[np.ndarray, tuple]:
+        """
+        Shared crop+downsample step for extract()/tiles()/process(). Returns
+        (array, actual_extent_um) -- actual_extent_um is the crop's real
+        resulting bounds from crop_to_micron_roi()'s snapped pixel boundary,
+        NOT the requested min/max passed in. crop_to_micron_roi() always
+        rounds outward (floor/ceil) to the nearest pixel, so the true crop
+        can be up to one pixel-width larger than requested on each edge --
+        callers that need the paired extent (process(), tiles()) must use
+        this actual value, not the request, or downstream polygon/mask
+        coordinates built from it drift by that amount at the ROI boundary.
+        """
+        import dask.array as da
+
+        cropped = channel.crop_to_micron_roi(
+            min_x_um=min_x, max_x_um=max_x,
+            min_y_um=min_y, max_y_um=max_y
+        )
+        arr = cropped.image.compute() if isinstance(cropped.image, da.Array) else cropped.image
+
+        native_mpp = abs(float(cropped.spatial_meta.transform_matrix[0, 0]))
+        arr = self._downsample_if_requested(arr, native_mpp, downsample_mpp)
+
+        return arr, cropped.spatial_meta.extent
+
     def extract(self, channel: ImageChannel,
                 downsample_mpp: Optional[float] = None) -> np.ndarray:
         """
@@ -147,18 +174,8 @@ class DataPort:
                             Only use when downsampling is deliberate (e.g. to match
                             a model's expected input). Default None = native resolution.
         """
-        import dask.array as da
-
         min_x, max_x, min_y, max_y = self.roi_extent
-        cropped = channel.crop_to_micron_roi(
-            min_x_um=min_x, max_x_um=max_x,
-            min_y_um=min_y, max_y_um=max_y
-        )
-        arr = cropped.image.compute() if isinstance(cropped.image, da.Array) else cropped.image
-
-        native_mpp = abs(float(cropped.spatial_meta.transform_matrix[0, 0]))
-        arr = self._downsample_if_requested(arr, native_mpp, downsample_mpp)
-
+        arr, _ = self._crop_and_downsample(channel, min_x, max_x, min_y, max_y, downsample_mpp)
         return arr
 
     # =========================================================================
@@ -288,7 +305,11 @@ class DataPort:
 
         tile_extent is (min_x, max_x, min_y, max_y) in absolute microns — use
         this to map any analysis result (e.g. CellPose cell centroids) back to
-        the global coordinate system without any extra bookkeeping.
+        the global coordinate system without any extra bookkeeping. This is the
+        tile crop's actual resulting bounds, not the requested grid coordinates
+        -- crop_to_micron_roi() always rounds outward to the nearest whole
+        pixel, so the true tile can be up to one pixel-width larger than the
+        grid math above on each edge.
 
         Tiling itself is only partially implemented: the DataPort can break the
         ROI up into tiles and hand each one to your function, but stitching the
@@ -312,8 +333,6 @@ class DataPort:
                             applied to each tile individually. Same meaning as
                             extract()'s downsample_mpp -- None = native resolution.
         """
-        import dask.array as da
-
         warnings.warn(
             "DataPort analysis has used tiling (tile_size_um set), but results "
             "have not been stitched or deduplicated -- an object spanning a "
@@ -330,17 +349,14 @@ class DataPort:
             y = min_y
             while y < max_y:
                 tile_max_y = min(y + tile_size_um, max_y)
-                extent = (x - overlap_um, tile_max_x + overlap_um,
-                          y - overlap_um, tile_max_y + overlap_um)
+                requested = (x - overlap_um, tile_max_x + overlap_um,
+                             y - overlap_um, tile_max_y + overlap_um)
                 try:
-                    cropped = channel.crop_to_micron_roi(
-                        min_x_um=extent[0], max_x_um=extent[1],
-                        min_y_um=extent[2], max_y_um=extent[3]
+                    arr, actual_extent = self._crop_and_downsample(
+                        channel, requested[0], requested[1], requested[2], requested[3],
+                        downsample_mpp
                     )
-                    arr = cropped.image.compute() if isinstance(cropped.image, da.Array) else cropped.image
-                    native_mpp = abs(float(cropped.spatial_meta.transform_matrix[0, 0]))
-                    arr = self._downsample_if_requested(arr, native_mpp, downsample_mpp)
-                    yield extent, arr
+                    yield actual_extent, arr
                 except ValueError:
                     pass  # tile outside image bounds — skip silently
                 y += tile_size_um
@@ -450,15 +466,21 @@ class DataPort:
             **fn_kwargs:    Passed straight through to fn unchanged.
 
         Returns:
-            List of (extent_um, result) tuples. extent_um is in absolute microns
-            so any spatial results (centroids, masks, etc.) can be anchored back
-            to the global coordinate system without extra work.
+            List of (extent_um, result) tuples. extent_um is the crop's actual
+            resulting bounds in absolute microns -- not necessarily identical to
+            the requested ROI, since crop_to_micron_roi() always rounds outward
+            to the nearest whole pixel, so a spatial result (centroids, masks,
+            etc.) anchored back using this value lands correctly even right at
+            the ROI boundary.
         """
         results = []
 
         if tile_size_um is None:
-            arr = self.extract(channel, downsample_mpp=downsample_mpp)
-            results.append((self.roi_extent, fn(arr, **fn_kwargs)))
+            min_x, max_x, min_y, max_y = self.roi_extent
+            arr, actual_extent = self._crop_and_downsample(
+                channel, min_x, max_x, min_y, max_y, downsample_mpp
+            )
+            results.append((actual_extent, fn(arr, **fn_kwargs)))
         else:
             for tile_extent, tile_arr in self.tiles(channel, tile_size_um, overlap_um,
                                                       downsample_mpp=downsample_mpp):
