@@ -1,5 +1,6 @@
 from dataclasses import dataclass, field
 from typing import Dict, Any, Tuple, Optional
+import numpy as np
 import pandas as pd
 
 from .image_channel import ImageChannel
@@ -154,6 +155,106 @@ class SampleSet:
                 out.cells[cell_name] = cell_chan
 
         out.rois  = dict(self.rois)
+        return out
+
+    def extract_polygon_roi(
+        self,
+        polygon_um,
+        new_name: Optional[str] = None,
+        cell_margin_um: float = 100.0
+    ) -> 'SampleSet':
+        """
+        Extract a polygon-shaped sub-region as a new SampleSet.
+
+        Two-pass: first extracts the polygon's axis-aligned bounding box via
+        extract_roi() unchanged (reusing all of its existing crop/filter
+        logic as-is), then blanks everything outside the actual polygon --
+        image pixels are zeroed at every pyramid level, transcript/spot rows
+        and cell boundaries outside the polygon are dropped. Useful when
+        tissue sections sit close enough together on a slide that a bounding
+        box tight enough to capture one section would still clip into a
+        neighbor.
+
+        Args:
+            polygon_um: [N, 2] array of (x, y) vertices in absolute microns.
+            new_name: Name for the extracted SampleSet. Defaults to self.name + '_roi'.
+            cell_margin_um: Same meaning as extract_roi()'s for the initial
+                bbox pass. Also used as a buffer distance around the polygon
+                itself for the final whole-cell filter, so a cell whose
+                centroid sits just outside the polygon but whose body still
+                overlaps isn't silently dropped.
+        """
+        import json
+        import cv2
+        from matplotlib.path import Path as MplPath
+        from shapely.geometry import Polygon as SPoly
+        from ..transform_utils import microns_to_pixels
+        from ..io_utils import build_spatial_block_index
+
+        poly = np.asarray(polygon_um, dtype=float)
+        min_x, max_x = poly[:, 0].min(), poly[:, 0].max()
+        min_y, max_y = poly[:, 1].min(), poly[:, 1].max()
+
+        out = self.extract_roi(
+            min_x, max_x, min_y, max_y, new_name=new_name, cell_margin_um=cell_margin_um
+        )
+
+        # --- Blank image pixels outside the polygon, every pyramid level ---
+        # Raw-loaded channels' own transforms are scale + translate only (no
+        # rotation -- that's a ViewPort render-time concept), so the polygon's
+        # micron vertices convert cleanly to each level's own pixel space.
+        for chan in out.images.values():
+            levels = {chan.mpp: chan.image, **chan.pyramid}
+            for level_mpp, arr in levels.items():
+                level_meta = chan.get_spatial_meta_for_level(level_mpp)
+                h, w = arr.shape[:2]
+                poly_px = microns_to_pixels(level_meta.transform_matrix, poly)
+                mask = np.zeros((h, w), dtype=np.uint8)
+                cv2.fillPoly(mask, [poly_px.round().astype(np.int32)], 1)
+                mask = mask.astype(bool)
+
+                is_dask = hasattr(arr, 'dask')
+                if is_dask:
+                    import dask.array as da
+                    blanked = da.where(mask[..., None] if arr.ndim == 3 else mask, arr, 0)
+                else:
+                    blanked = np.where(mask[..., None] if arr.ndim == 3 else mask, arr, 0)
+
+                if level_mpp == chan.mpp:
+                    chan.image = blanked
+                else:
+                    chan.pyramid[level_mpp] = blanked
+
+        # --- Drop omic rows (transcripts / spot centers) outside the polygon ---
+        path = MplPath(poly)
+        for omic in out.omics.values():
+            coords = omic.data.obsm['spatial']
+            inside = path.contains_points(coords)
+            omic.data = omic.data[inside].copy()
+            if omic.pyramid:
+                omic.pyramid = {k: v[inside] for k, v in omic.pyramid.items()}
+            # Bbox pass already rebuilt this once in extract_roi(); rebuild
+            # again now that the polygon has tightened the row set further.
+            if 'block_index' in omic.data.uns:
+                bi = json.loads(omic.data.uns['block_index'])
+                omic.data = build_spatial_block_index(
+                    omic.data, mpp=bi['mpp'], chunk_px=bi['chunk_px'], gene_col='feature'
+                )
+
+        # --- Filter cell boundaries by polygon too (whole-cell rule) ---
+        buffered = SPoly(poly).buffer(cell_margin_um)
+        if buffered.geom_type == 'MultiPolygon':
+            buffered = max(buffered.geoms, key=lambda g: g.area)
+        buffered_path = MplPath(np.array(buffered.exterior.coords))
+
+        for cell_chan in out.cells.values():
+            b = cell_chan.boundaries
+            if isinstance(b, pd.DataFrame) and {'cell_id', 'x', 'y'}.issubset(b.columns):
+                vertex_inside = buffered_path.contains_points(b[['x', 'y']].values)
+                keep_ids = b.loc[vertex_inside, 'cell_id'].unique()
+                cell_chan.boundaries = b[b['cell_id'].isin(keep_ids)].copy()
+            # else: unrecognized boundary schema -- leave as-is, same as extract_roi()
+
         return out
 
     def viewport(
