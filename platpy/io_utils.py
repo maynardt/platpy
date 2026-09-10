@@ -188,6 +188,14 @@ def build_transcript_alpha_table(adata, platform: str, bin_um: Optional[float] =
         (e.g. the paired image channel's second-coarsest pyramid level, not the
         full-slide thumbnail level, which would under-represent the contrast a
         user actually sees when zoomed in); required for this platform.
+        Computed via a sparse (gene, bin) groupby rather than a dense
+        n_genes x n_bins array -- a real 5K-panel / 73M-transcript Xenium
+        section has enough spatial bins at typical bin_um that the dense
+        version can reach multi-TiB memory. _percentile_row()'s math only
+        ever needs each gene's *nonzero* per-bin counts plus a zero-bin count
+        (pure arithmetic: n_bins - nnz), never a materialized dense row, so
+        the sparse groupby result is sufficient and stays O(N) regardless of
+        how many bins bin_um produces.
 
     Genes with fewer than _TRANSCRIPT_ALPHA_MIN_SUM total counts skip the full
     percentile computation entirely and get a cheap [max, sum] pair in
@@ -222,20 +230,36 @@ def build_transcript_alpha_table(adata, platform: str, bin_um: Optional[float] =
         by = np.floor((coords[:, 1] - min_y) / bin_um).astype(int)
         n_bx, n_by = int(bx.max()) + 1, int(by.max()) + 1
         bin_id = by * n_bx + bx
-        n_bins = n_bx * n_by
+        n_bins = n_bx * n_by  # used only as a scalar from here on -- never allocated
 
-        # Total transcript count per gene -- just a row count per gene, no
-        # binning needed -- so this cheap pre-filter costs nothing extra even
-        # though the histogram itself still needs building either way to get max.
-        unique_genes, gene_totals = np.unique(genes_arr, return_counts=True)
+        # sort=True matches np.unique's lexicographic gene ordering.
+        gene_codes, unique_genes = pd.factorize(genes_arr, sort=True)
+        n_genes = len(unique_genes)
+        gene_totals = np.bincount(gene_codes, minlength=n_genes)
+
+        # Sparse (gene, bin) -> count. Size is bounded by the number of DISTINCT
+        # (gene, bin) pairs actually observed (<= N transcripts) -- never
+        # n_genes * n_bins, which is what made the old dense bincount-per-gene
+        # version blow up on real whole-panel Xenium data.
+        sparse_counts = (
+            pd.DataFrame({'gene_code': gene_codes, 'bin_id': bin_id})
+            .groupby(['gene_code', 'bin_id'])
+            .size()
+        )
 
         gene_table, genes_reduced = {}, {}
-        for gene, total in zip(unique_genes, gene_totals):
-            counts = np.bincount(bin_id[genes_arr == gene], minlength=n_bins)
+        for gene_code, per_gene in sparse_counts.groupby(level='gene_code'):
+            gene = unique_genes[gene_code]
+            total = int(gene_totals[gene_code])
+            nonzero_vals = per_gene.to_numpy()  # this gene's nonzero per-bin counts only
+
             if total < _TRANSCRIPT_ALPHA_MIN_SUM:
-                genes_reduced[str(gene)] = [float(counts.max()) if counts.size else 0.0, float(total)]
+                genes_reduced[str(gene)] = [float(nonzero_vals.max()), float(total)]
             else:
-                gene_table[str(gene)] = _percentile_row(counts)
+                nonzero_sorted = np.sort(nonzero_vals)
+                first_nonzero_rank = n_bins - len(nonzero_sorted)  # = count of zero bins
+                percentiles = np.percentile(nonzero_sorted, _TRANSCRIPT_ALPHA_PCT_KEYS).tolist()
+                gene_table[str(gene)] = percentiles + [int(first_nonzero_rank), float(total)]
 
         return {'bin_um': float(bin_um), 'min_sum_threshold': _TRANSCRIPT_ALPHA_MIN_SUM,
                 'genes': gene_table, 'genes_reduced': genes_reduced}
