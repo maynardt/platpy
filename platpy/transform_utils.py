@@ -59,11 +59,24 @@ def get_poly_bounds(poly_pts: np.ndarray) -> Tuple[float, float, float, float]:
     max_x, max_y = np.nanmax(poly_pts, axis=0)
     return float(min_x), float(max_x), float(min_y), float(max_y)
 
-def is_poly_axis_aligned(poly_pts: np.ndarray, tolerance: float = 1e-5) -> bool:
-    """Checks if a polygon is a rectangle aligned to the X/Y axes."""
-    unique_x = np.unique(np.round(poly_pts[:, 0] / tolerance) * tolerance)
-    unique_y = np.unique(np.round(poly_pts[:, 1] / tolerance) * tolerance)
-    return len(unique_x) == 2 and len(unique_y) == 2
+def is_poly_axis_aligned(poly_pts: np.ndarray, tolerance: float = 1e-6) -> bool:
+    """
+    Checks if a polygon is a rectangle aligned to the X/Y axes.
+
+    Area-based, not a count of unique x/y values: a right triangle with
+    axis-aligned legs (e.g. [[10,10],[60,10],[10,60]]) also has exactly 2
+    unique x's and 2 unique y's, so that count alone misclassifies it as a
+    rectangle. True only when the polygon's own area equals its bounding
+    box's area -- i.e. it actually fills its AABB, not just shares it.
+    `tolerance` is a fraction of the AABB's area.
+    """
+    from shapely.geometry import Polygon
+    min_x, max_x, min_y, max_y = get_poly_bounds(poly_pts)
+    aabb_area = (max_x - min_x) * (max_y - min_y)
+    if aabb_area <= 0:
+        return True  # degenerate -- nothing meaningful to mask either way
+    poly_area = Polygon(poly_pts).area
+    return abs(poly_area - aabb_area) < tolerance * aabb_area
 
 # =============================================================================
 # SPATIAL METADATA (THE ABSOLUTE TRUTH)

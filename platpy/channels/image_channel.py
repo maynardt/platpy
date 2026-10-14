@@ -204,7 +204,7 @@ class ImageChannel(BaseChannel):
         Preserves sub-pixel origin accuracy in the returned channel's spatial metadata.
         Dask-aware: materializes only the cropped region.
         """
-        from ..transform_utils import get_poly_bounds
+        from ..transform_utils import get_poly_bounds, is_poly_axis_aligned, microns_to_pixels
         from numpy.linalg import inv
 
         # --- 1. Resolve input to (_min_x, _max_x, _min_y, _max_y) ---
@@ -227,6 +227,12 @@ class ImageChannel(BaseChannel):
 
         if any(v is None for v in (_min_x, _max_x, _min_y, _max_y)):
             raise ValueError("Must provide 4 explicit bounds or a valid ROI polygon.")
+
+        # A non-rectangular polygon needs real pixel-level blanking below (step 4b) --
+        # a plain rectangle (or no polygon at all) is already exactly right after the
+        # bbox crop alone, so this flag lets that common case skip the extra work.
+        poly_needs_blanking = (roi_poly_um is not None
+                                and not is_poly_axis_aligned(np.asarray(roi_poly_um, dtype=float)))
 
         true_min_x, true_max_x = min(_min_x, _max_x), max(_min_x, _max_x)   #type: ignore
         true_min_y, true_max_y = min(_min_y, _max_y), max(_min_y, _max_y)   #type: ignore
@@ -263,6 +269,20 @@ class ImageChannel(BaseChannel):
         # --- 4. Crop (Dask slicing stays lazy until compute() is called) ---
         cropped_img = self.image[y0:y1, x0:x1]
 
+        # --- 4b. Blank pixels outside the true polygon (non-rectangular ROIs only) ---
+        # The bbox crop above is only ever an AABB -- for a true (non-rectangular)
+        # polygon that leaves tissue/transcripts from outside the actual outline
+        # still present in the corners. Mirrors the two-pass bbox-then-blank
+        # approach SampleSet.extract_polygon_roi() already uses for omics/cells.
+        if poly_needs_blanking:
+            from skimage.draw import polygon2mask
+            poly_px_base = microns_to_pixels(M, np.asarray(roi_poly_um, dtype=float))
+            local_poly_base = poly_px_base - np.array([x0, y0])
+            base_mask = polygon2mask(cropped_img.shape[:2], local_poly_base[:, ::-1])  # (row,col)=(y,x)
+            mask_b = base_mask[..., None] if cropped_img.ndim == 3 else base_mask
+            cropped_img = (da.where(mask_b, cropped_img, 0) if hasattr(cropped_img, 'compute')
+                           else np.where(mask_b, cropped_img, 0))
+
         # --- 5. Recalculate origin: pixel (x0, y0) maps to which micron coordinate? ---
         new_origin = M @ np.array([x0, y0, 1.0])
         new_M = M.copy()
@@ -284,7 +304,23 @@ class ImageChannel(BaseChannel):
             ly0 = max(0, int(y0 / factor))
             ly1 = min(lh, int(np.ceil(y1 / factor)))
             if lx1 > lx0 and ly1 > ly0:
-                cropped_pyramid[level_mpp] = level_arr[ly0:ly1, lx0:lx1]
+                level_crop = level_arr[ly0:ly1, lx0:lx1]
+                if poly_needs_blanking:
+                    # Downsample the already-rasterized base-resolution mask rather
+                    # than re-running polygon2mask at this level's own resolution --
+                    # re-rasterizing per pyramid level (and this got called once per
+                    # image channel too) was the confirmed ~4-12x redundant-work
+                    # multiplier in the field notes this upstreams. skimage.resize
+                    # (not plain striding) handles the fact that this level's own
+                    # crop bounds were independently rounded, so its shape isn't
+                    # always an exact integer downsample of the base crop's shape.
+                    from skimage.transform import resize
+                    lvl_mask = resize(base_mask, level_crop.shape[:2], order=0,
+                                       anti_aliasing=False, preserve_range=True).astype(bool)
+                    mask_b = lvl_mask[..., None] if level_crop.ndim == 3 else lvl_mask
+                    level_crop = (da.where(mask_b, level_crop, 0) if hasattr(level_crop, 'compute')
+                                  else np.where(mask_b, level_crop, 0))
+                cropped_pyramid[level_mpp] = level_crop
 
         return ImageChannel(
             name=f"{self.name}_crop",
