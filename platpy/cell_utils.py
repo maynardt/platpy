@@ -34,27 +34,68 @@ def _encode_coord(val_um, precision=10):
 # Xenium-specific
 # =============================================================================
 
-def build_cells_xenium(sample):
+# Bumped when build_cells_xenium()'s algorithm changes (binning rule, centroid
+# source, dropped-codeword pattern, etc). Stamped onto every AnnData this
+# builds (adata.uns['build_cells_xenium_version']) so a save-time cache from
+# an older platpy is never silently trusted as if it were current -- see
+# save_sample()'s build_default_cells handling in io_utils.py.
+BUILD_CELLS_XENIUM_VERSION = 1
+
+
+def build_cells_xenium(sample, force_recompute: bool = False, verbose: bool = True):
     """
     Build a cells x genes AnnData from Xenium transcript data.
 
     Uses the cell assignments made by the Xenium instrument (cell_id column).
     Unassigned transcripts (cell_id 0, -1, or 'UNASSIGNED') are dropped.
 
-    Cell centroid = mean (x, y) of each cell's assigned transcripts.
+    Cell centroid and area come from the instrument's own segmented polygon
+    (sample.cells['cell_boundaries'].summary, derived at load time from the
+    cell_boundaries.parquet) rather than the transcripts -- the true cell
+    shape/centroid, not an approximation from wherever its transcripts happened
+    to land. Falls back to a transcript-mean centroid (with no area) only for
+    bundles saved before that summary existed.
+
+    save_sample() caches this result on sample.cells['cell_boundaries'].data
+    at save time (the expensive part -- loading/processing the raw data --
+    already happened once then, so this is a small marginal cost). By default
+    this function returns that cache directly rather than recomputing, as long
+    as it was stamped with the current BUILD_CELLS_XENIUM_VERSION -- the cache
+    is a convenience, not the only path: the raw transcripts stay available
+    regardless, so pass force_recompute=True for a different cell definition
+    (different binning, boundary source, QC thresholds, etc).
 
     Parameters
     ----------
     sample : SampleSet
         Loaded Xenium sample.  Must have sample.omics['transcripts'] with obs
         columns: cell_id, feature, x, y.
+    force_recompute : bool
+        Skip the save-time cache (if any) and recompute from the raw
+        transcripts every time.
+    verbose : bool
+        Print progress/diagnostics. save_sample() passes False to keep an
+        automatic save-time build quiet.
 
     Returns
     -------
     AnnData  (n_cells x n_genes)
-        obs : sample_id, x_micron, y_micron, n_transcripts, n_genes
+        obs : sample_id, x_micron, y_micron, area_um2 (if available),
+              n_transcripts, n_genes
         obsm['spatial'] : (n_cells, 2) centroid coordinates in microns
     """
+    boundary_chan = sample.cells.get('cell_boundaries')
+    if not force_recompute and boundary_chan is not None and boundary_chan.data is not None:
+        cached_version = boundary_chan.data.uns.get('build_cells_xenium_version')
+        if cached_version == BUILD_CELLS_XENIUM_VERSION:
+            if verbose:
+                print(f"Using cell x gene matrix cached at save time "
+                      f"({boundary_chan.data.n_obs:,} cells x {boundary_chan.data.n_vars:,} genes).")
+            return boundary_chan.data
+        elif verbose:
+            print(f"Cached cell x gene matrix is from an older platpy "
+                  f"(version {cached_version}, current {BUILD_CELLS_XENIUM_VERSION}) -- recomputing.")
+
     # Pull only the columns we need to keep memory footprint small
     tx = sample.omics['transcripts'].data.obs[['cell_id', 'feature', 'x', 'y']].copy()
 
@@ -69,16 +110,19 @@ def build_cells_xenium(sample):
     n_codeword = codeword_mask.sum()
     if n_codeword > 0:
         tx = tx[~codeword_mask]
-        print(f"Dropped {n_codeword:,} codeword transcripts "
-              f"(NegControl/Unassigned/Deprecated/BLANK)")
+        if verbose:
+            print(f"Dropped {n_codeword:,} codeword transcripts "
+                  f"(NegControl/Unassigned/Deprecated/BLANK)")
 
-    print(f"Transcripts assigned to cells: {len(tx):,}")
+    if verbose:
+        print(f"Transcripts assigned to cells: {len(tx):,}")
 
     # Sorted lists set the row/column order of the matrix
     cells = sorted(tx['cell_id'].unique())
     genes = sorted(tx['feature'].unique())
     n_cells, n_genes = len(cells), len(genes)
-    print(f"  Cells: {n_cells:,}   Genes: {n_genes:,}")
+    if verbose:
+        print(f"  Cells: {n_cells:,}   Genes: {n_genes:,}")
 
     cell_idx = {c: i for i, c in enumerate(cells)}
     gene_idx = {g: i for i, g in enumerate(genes)}
@@ -92,13 +136,26 @@ def build_cells_xenium(sample):
         shape=(n_cells, n_genes)
     )
 
-    # Centroid = mean position of the cell's transcripts
-    centroids = tx.groupby('cell_id')[['x', 'y']].mean().loc[cells]
+    boundary_summary = boundary_chan.summary if boundary_chan is not None else None
+
+    if boundary_summary is not None:
+        bs = boundary_summary.copy()
+        bs.index = bs.index.astype(str)
+        centroids = bs.reindex(cells)[['x', 'y', 'area_um2']]
+        area_um2 = centroids['area_um2'].values
+    else:
+        if verbose:
+            print("No cell_boundaries summary found -- falling back to transcript-mean "
+                  "centroid (no polygon area available). Re-extract this bundle with a "
+                  "current platpy to get true instrument-segmented centroids.")
+        centroids = tx.groupby('cell_id')[['x', 'y']].mean().loc[cells]
+        area_um2 = np.full(n_cells, np.nan)
 
     obs = pd.DataFrame({
         'sample_id':     sample.name,
         'x_micron':      centroids['x'].values,
         'y_micron':      centroids['y'].values,
+        'area_um2':      area_um2,
         'n_transcripts': np.asarray(X.sum(axis=1)).flatten().astype(int),
         'n_genes':       np.asarray((X > 0).sum(axis=1)).flatten().astype(int),
     }, index=pd.Index(cells, name='cell_id'))
@@ -114,6 +171,7 @@ def build_cells_xenium(sample):
             'scalefactors': {'tissue_hires_scalef': 1.0, 'spot_diameter_fullres': 15.0}
         }
     }
+    adata.uns['build_cells_xenium_version'] = BUILD_CELLS_XENIUM_VERSION
 
     return adata
 

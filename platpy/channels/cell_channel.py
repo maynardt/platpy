@@ -30,6 +30,11 @@ class CellChannel(BaseChannel):
     """
     data:       Optional[Any] = None   # cells×genes AnnData; obs needs x_micron, y_micron
     boundaries: Any           = None   # polygon boundaries (optional; from mask_to_roi_channel)
+    summary:    Any           = None   # per-cell DataFrame (index=cell_id) derived from boundaries:
+                                        # true polygon centroid (x, y), area_um2, n_vertices, label_id.
+                                        # Not a second source of truth -- always recomputable from
+                                        # `boundaries`; kept alongside it so callers get an O(1)
+                                        # per-cell lookup instead of a groupby every time.
 
     # ------------------------------------------------------------------
     # Identity plot

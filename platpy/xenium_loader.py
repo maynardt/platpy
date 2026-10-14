@@ -18,6 +18,81 @@ from .io_utils import build_spatial_block_index
 # Set up library-level logger
 logger = logging.getLogger(__name__)
 
+def _polygon_summary(vertices: pd.DataFrame) -> pd.DataFrame:
+    """
+    Derive a one-row-per-cell summary (true polygon centroid + area) from a
+    long-format vertex table (cell_id, x, y, ...).
+
+    Uses the shoelace formula, vectorized across all cells at once -- a plain
+    mean of a cell's vertices is biased toward whatever side of the outline
+    happens to carry more vertices, so this walks the actual polygon edges
+    instead. Vertices within each cell_id's run are assumed to already trace
+    the outline in order (as Xenium exports them); the edge from the last
+    vertex back to the first is closed by wrapping within each group, not
+    across group boundaries.
+    """
+    df = vertices.reset_index(drop=True)
+    cell_id = df['cell_id'].to_numpy()
+    x = df['x'].to_numpy(dtype=np.float64)
+    y = df['y'].to_numpy(dtype=np.float64)
+    n = len(df)
+
+    is_group_start = np.empty(n, dtype=bool)
+    is_group_start[0] = True
+    is_group_start[1:] = cell_id[1:] != cell_id[:-1]
+    group_start_idx = np.nonzero(is_group_start)[0]
+    group_id_of_row = np.cumsum(is_group_start) - 1
+
+    is_group_end = np.empty(n, dtype=bool)
+    is_group_end[:-1] = is_group_start[1:]
+    is_group_end[-1] = True
+
+    # Next vertex along the outline, wrapping to each group's own first vertex
+    # (not the next cell's first vertex) at each group's last row.
+    x_next = np.roll(x, -1)
+    y_next = np.roll(y, -1)
+    x_next[is_group_end] = x[group_start_idx[group_id_of_row[is_group_end]]]
+    y_next[is_group_end] = y[group_start_idx[group_id_of_row[is_group_end]]]
+
+    cross = x * y_next - x_next * y
+
+    agg = pd.DataFrame({
+        'cell_id':  df['cell_id'],
+        'cross':    cross,
+        'cx_term':  (x + x_next) * cross,
+        'cy_term':  (y + y_next) * cross,
+    }).groupby('cell_id', sort=False).sum()
+
+    signed_area2 = agg['cross']  # = 2x the signed polygon area
+    area_um2 = (signed_area2 / 2.0).abs()
+
+    with np.errstate(divide='ignore', invalid='ignore'):
+        cx = agg['cx_term'] / (3.0 * signed_area2)
+        cy = agg['cy_term'] / (3.0 * signed_area2)
+
+    # Degenerate polygons (near-zero area -- duplicate/collinear vertices)
+    # can't use the area-weighted formula; fall back to a plain vertex mean.
+    degenerate = signed_area2.abs() < 1e-6
+    if degenerate.any():
+        g = df.groupby('cell_id', sort=False)
+        vx_mean, vy_mean = g['x'].mean(), g['y'].mean()
+        cx = cx.where(~degenerate, vx_mean)
+        cy = cy.where(~degenerate, vy_mean)
+
+    g = df.groupby('cell_id', sort=False)
+    summary = pd.DataFrame({
+        'x':          cx,
+        'y':          cy,
+        'area_um2':   area_um2,
+        'n_vertices': g.size(),
+    })
+    if 'label_id' in df.columns:
+        summary['label_id'] = g['label_id'].first()
+
+    summary.index.name = 'cell_id'
+    return summary
+
+
 def _load_boundaries(x_dir: Path) -> Optional[CellChannel]:
     """Loads Xenium cell boundary polygons into a CellChannel."""
     bounds_path = x_dir / "cell_boundaries.parquet"
@@ -40,10 +115,14 @@ def _load_boundaries(x_dir: Path) -> Optional[CellChannel]:
         if 'vertex_y' in df.columns: rename_map['vertex_y'] = 'y'
         if rename_map:
             df = df.rename(columns=rename_map)
-            
+
+        summary = _polygon_summary(df)
+        logger.info(f"     + Derived per-cell centroid/area for {len(summary):,} cells")
+
         return CellChannel(
             name="cell_boundaries",
-            boundaries=df, 
+            boundaries=df,
+            summary=summary,
             metadata={"source": bounds_path.name}
         )
         
