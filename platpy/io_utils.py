@@ -14,7 +14,8 @@ from typing import Optional, Any, Dict
 
 # platpy imports
 from .channels import SampleSet, CellChannel, ImageChannel, OmicChannel, ROIChannel
-from .transform_utils import SpatialMetadata 
+from .transform_utils import SpatialMetadata
+from .cell_utils import build_cells_xenium
 
 logger = logging.getLogger(__name__)
 
@@ -381,16 +382,29 @@ def save_sample(
     overwrite: bool = False,
     clevel: int = 5,
     keep_2um_bins: bool = False,
+    build_default_cells: bool = True,
     **kwargs
 ):
     """
     Saves a platpy SampleSet to disk as a unified Zarr directory structure.
-    
+
     Args:
         sample: The SampleSet to save.
         out_prefix: Directory path to save the sample.
         overwrite: If True, replaces existing data at out_prefix.
         clevel: Compression level (0-9). Default 5. Uses Blosc LZ4 + Bitshuffle.
+        build_default_cells: For a Xenium sample with a 'cell_boundaries' cell
+            channel, build the default cell x gene matrix (build_cells_xenium())
+            and cache it on that channel's .data before saving, so later
+            load_sample() + build_cells_xenium() calls skip recomputing it --
+            the expensive part (loading/processing the raw data) already
+            happened once to get here, so this is a small marginal cost now
+            vs. a repeated one on every future reload. Set False to skip this
+            when the caller already knows they want a different cell
+            definition (different binning, boundary source, QC thresholds)
+            and don't want save time spent on a default that won't be used.
+            The raw transcripts/boundaries are saved either way -- this cache
+            is a convenience, never the only path to a cell x gene matrix.
     """
     out_path = Path(out_prefix)
     
@@ -533,6 +547,15 @@ def save_sample(
     if sample.cells:
         cells_dir = out_path / "cells"
         cells_dir.mkdir(exist_ok=True)
+
+        transcripts_chan = sample.omics.get('transcripts')
+        is_xenium = transcripts_chan is not None and transcripts_chan.metadata.get('platform') == 'xenium'
+        if build_default_cells and is_xenium and 'cell_boundaries' in sample.cells:
+            default_cells = build_cells_xenium(sample, verbose=False)
+            sample.cells['cell_boundaries'].data = default_cells
+            logger.info(f"  + Built default cell x gene matrix "
+                        f"({default_cells.n_obs:,} cells x {default_cells.n_vars:,} genes)")
+
         for name, cell_chan in sample.cells.items():
             dest_path = cells_dir / f"{name}.zarr"
             if overwrite and dest_path.exists():
@@ -547,8 +570,29 @@ def save_sample(
             adata.uns['spatial_meta'] = np.array(cell_chan.spatial_meta.transform_matrix).tolist()
             # FIX: Persist cell channel metadata
             adata.uns['channel_meta'] = _sanitize_for_zarr(cell_chan.metadata)
-            
+
             adata.write_zarr(dest_path)
+
+            # Per-cell centroid/area summary (derived from boundaries, not a
+            # second source of truth) -- stored as its own parquet since it's
+            # one row per cell, a different row count than the per-vertex
+            # table above.
+            if cell_chan.summary is not None:
+                summary_path = cells_dir / f"{name}_summary.parquet"
+                cell_chan.summary.to_parquet(summary_path)
+                logger.info(f"  + Saved Cell Summary: {name} ({len(cell_chan.summary):,} cells)")
+
+            # Default cell x gene matrix (see build_default_cells above) -- its
+            # own zarr since it's one row per cell, a different row count than
+            # the per-vertex boundaries table.
+            if cell_chan.data is not None:
+                data_path = cells_dir / f"{name}_cells.zarr"
+                if overwrite and data_path.exists():
+                    shutil.rmtree(data_path, onexc=_remove_readonly)
+                cell_chan.data.write_zarr(data_path)
+                logger.info(f"  + Saved Cell x Gene Matrix: {name} "
+                            f"({cell_chan.data.n_obs:,} cells x {cell_chan.data.n_vars:,} genes)")
+
             logger.info(f"  + Saved Cell Channel: {name}")
 
 
@@ -723,16 +767,45 @@ def load_sample(in_path_str: str, verbose: bool = True, load_2um_bin: bool = Fal
     cells_dir = in_path / "cells"
     if cells_dir.exists():
         for cell_path in cells_dir.glob("*.zarr"):
+            # {name}_cells.zarr is the cached default cell x gene matrix for
+            # the "{name}" channel this loop is building, not a boundary
+            # table of its own -- skip it here, loaded explicitly below.
+            if cell_path.stem.endswith('_cells'):
+                continue
             name = cell_path.stem
             adata = ad.read_zarr(cell_path)
             spatial_mat = np.array(adata.uns.get('spatial_meta', np.eye(3)))
             spatial = SpatialMetadata(transform_matrix=spatial_mat)
-            
+
             # FIX: Restore the channel metadata
             channel_meta = adata.uns.get('channel_meta', {})
-            
-            cell_chan = CellChannel(name=name, boundaries=adata, spatial_meta=spatial, metadata=channel_meta)
+
+            summary_path = cells_dir / f"{name}_summary.parquet"
+            summary = pd.read_parquet(summary_path) if summary_path.exists() else None
+
+            # Cached default cell x gene matrix (see save_sample()'s
+            # build_default_cells). Built once at save time and never mutated
+            # afterward, so skipping AnnData's O(n) obs-index uniqueness check
+            # on reload is safe by construction -- the index was already
+            # validated the one time it was created.
+            data_path = cells_dir / f"{name}_cells.zarr"
+            data = None
+            if data_path.exists():
+                with ad.settings.override(check_uniqueness=False):
+                    data = ad.read_zarr(data_path)
+
+            cell_chan = CellChannel(name=name, boundaries=adata, data=data, summary=summary,
+                                     spatial_meta=spatial, metadata=channel_meta)
             sample.cells[name] = cell_chan
+
+    # save_sample() always writes sample_info['rois'] (polygons + metadata) into
+    # sample_meta.json, but this reconstruction loop was previously missing
+    # entirely -- any ROI added via add_roi() was silently lost on every reload.
+    for name, roi_info in sample_info.get('rois', {}).items():
+        polygons = {k: np.array(v) for k, v in roi_info.get('polygons', {}).items()}
+        sample.rois[name] = ROIChannel(
+            name=name, polygons=polygons, metadata=roi_info.get('metadata', {})
+        )
 
     if verbose:
         print(f"  - Image channels loaded: {', '.join(sample.images.keys())}")

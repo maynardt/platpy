@@ -1,12 +1,41 @@
 from dataclasses import dataclass, field
 from typing import Dict, Any, Tuple, Optional
 import numpy as np
-import pandas as pd
 
 from .image_channel import ImageChannel
 from .omic_channel import OmicChannel
 from .cell_channel import CellChannel
 from .roi_channel import ROIChannel
+
+
+def _cropped_omic_metadata(metadata, n_obs):
+    """
+    Recompute `total_transcripts` for a cropped OmicChannel instead of
+    carrying the parent's pre-crop count forward unchanged via .copy() --
+    xenium_loader.py sets it once at ingestion as len(df), so without this
+    every extracted sub-region/section bundle would report its *parent
+    slide's* full count forever, never its own. Preserves the original
+    pre-crop count as `source_total_transcripts`, set only the first time a
+    channel is cropped so re-cropping an already-cropped SampleSet doesn't
+    overwrite it with an intermediate count.
+    """
+    meta = metadata.copy()
+    if 'source_total_transcripts' not in meta:
+        meta['source_total_transcripts'] = meta.get('total_transcripts')
+    meta['total_transcripts'] = n_obs
+    return meta
+
+
+def _boundary_obs(b):
+    """
+    Return the (cell_id, x, y, ...) table underlying a CellChannel.boundaries
+    value, regardless of whether it's still the plain DataFrame produced by a
+    fresh load_xenium() or the AnnData produced by a save_sample()/
+    load_sample() round-trip (write_zarr/read_zarr always go through AnnData).
+    `b` itself stays indexable by the same boolean row mask either way.
+    """
+    return b.obs if hasattr(b, 'obs') else b
+
 
 @dataclass
 class SampleSet:
@@ -109,7 +138,7 @@ class SampleSet:
                 out.omics[om_name] = OmicChannel(
                     name=om_name,
                     data=extracted,
-                    metadata=omic.metadata.copy()
+                    metadata=_cropped_omic_metadata(omic.metadata, extracted.n_obs)
                 )
             else:
                 coords = omic.data.obsm['spatial']
@@ -117,11 +146,12 @@ class SampleSet:
                     (coords[:, 0] >= min_x_um) & (coords[:, 0] <= max_x_um) &
                     (coords[:, 1] >= min_y_um) & (coords[:, 1] <= max_y_um)
                 )
+                cropped_data = omic.data[mask].copy()
                 out.omics[om_name] = OmicChannel(
                     name=om_name,
-                    data=omic.data[mask].copy(),
+                    data=cropped_data,
                     spatial_meta=omic.spatial_meta,
-                    metadata=omic.metadata.copy(),
+                    metadata=_cropped_omic_metadata(omic.metadata, cropped_data.n_obs),
                     pyramid={k: v[mask] for k, v in omic.pyramid.items()}
                 )
 
@@ -131,20 +161,28 @@ class SampleSet:
         out.cells = {}
         for cell_name, cell_chan in self.cells.items():
             b = cell_chan.boundaries
-            if isinstance(b, pd.DataFrame) and {'cell_id', 'x', 'y'}.issubset(b.columns):
+            b_obs = _boundary_obs(b)
+            if b_obs is not None and {'cell_id', 'x', 'y'}.issubset(b_obs.columns):
                 # Boundaries are one row per polygon *vertex* -- filter by whole
                 # cell_id, not by row, or a kept cell's polygon would be
                 # silently mangled (only the vertices that happened to fall
                 # inside the box, rather than its true shape).
                 vertex_in_margin = (
-                    (b['x'] >= margin_min_x) & (b['x'] <= margin_max_x) &
-                    (b['y'] >= margin_min_y) & (b['y'] <= margin_max_y)
+                    (b_obs['x'] >= margin_min_x) & (b_obs['x'] <= margin_max_x) &
+                    (b_obs['y'] >= margin_min_y) & (b_obs['y'] <= margin_max_y)
                 )
-                keep_ids = b.loc[vertex_in_margin, 'cell_id'].unique()
+                keep_ids = b_obs.loc[vertex_in_margin, 'cell_id'].unique()
+                row_mask = b_obs['cell_id'].isin(keep_ids).to_numpy()
+
+                summary = cell_chan.summary
+                kept_summary = (summary.loc[summary.index.isin(keep_ids)].copy()
+                                if summary is not None else None)
+
                 out.cells[cell_name] = CellChannel(
                     name=cell_chan.name,
                     data=cell_chan.data,
-                    boundaries=b[b['cell_id'].isin(keep_ids)].copy(),
+                    boundaries=b[row_mask].copy(),
+                    summary=kept_summary,
                     spatial_meta=cell_chan.spatial_meta,
                     metadata=cell_chan.metadata.copy()
                 )
@@ -154,7 +192,25 @@ class SampleSet:
                 # channel as-is rather than silently dropping or corrupting it.
                 out.cells[cell_name] = cell_chan
 
-        out.rois  = dict(self.rois)
+        out.rois = dict(self.rois)
+
+        # Record the crop actually used as provenance on the returned bundle --
+        # previously `out.rois` only ever carried over whatever ROIs already
+        # existed on the parent, with no record of the bounds that produced
+        # `out` itself. A reloaded bundle had no built-in way to answer "what
+        # region of its parent was I cropped from" without an external manifest.
+        out.add_roi(ROIChannel(
+            name='extraction_bounds',
+            polygons={'extraction_bounds': np.array([
+                [min_x_um, min_y_um], [max_x_um, min_y_um],
+                [max_x_um, max_y_um], [min_x_um, max_y_um],
+            ])},
+            metadata={
+                'source_sample': self.name,
+                'min_x_um': float(min_x_um), 'max_x_um': float(max_x_um),
+                'min_y_um': float(min_y_um), 'max_y_um': float(max_y_um),
+            }
+        ))
         return out
 
     def extract_polygon_roi(
@@ -240,6 +296,11 @@ class SampleSet:
                 omic.data = build_spatial_block_index(
                     omic.data, mpp=bi['mpp'], chunk_px=bi['chunk_px'], gene_col='feature'
                 )
+            # extract_roi()'s bbox pass already set total_transcripts once;
+            # the polygon pass above tightens the row set further, so redo it
+            # (source_total_transcripts is untouched -- already set to the
+            # true pre-crop count by that first pass).
+            omic.metadata = _cropped_omic_metadata(omic.metadata, omic.data.n_obs)
 
         # --- Filter cell boundaries by polygon too (whole-cell rule) ---
         buffered = SPoly(poly).buffer(cell_margin_um)
@@ -249,12 +310,26 @@ class SampleSet:
 
         for cell_chan in out.cells.values():
             b = cell_chan.boundaries
-            if isinstance(b, pd.DataFrame) and {'cell_id', 'x', 'y'}.issubset(b.columns):
-                vertex_inside = buffered_path.contains_points(b[['x', 'y']].values)
-                keep_ids = b.loc[vertex_inside, 'cell_id'].unique()
-                cell_chan.boundaries = b[b['cell_id'].isin(keep_ids)].copy()
+            b_obs = _boundary_obs(b)
+            if b_obs is not None and {'cell_id', 'x', 'y'}.issubset(b_obs.columns):
+                vertex_inside = buffered_path.contains_points(b_obs[['x', 'y']].values)
+                keep_ids = b_obs.loc[vertex_inside, 'cell_id'].unique()
+                row_mask = b_obs['cell_id'].isin(keep_ids).to_numpy()
+                cell_chan.boundaries = b[row_mask].copy()
+                if cell_chan.summary is not None:
+                    cell_chan.summary = cell_chan.summary.loc[
+                        cell_chan.summary.index.isin(keep_ids)
+                    ].copy()
             # else: unrecognized boundary schema -- leave as-is, same as extract_roi()
 
+        # The inner extract_roi() call above already recorded 'extraction_bounds'
+        # as the bbox it used -- overwrite it with the true polygon actually
+        # applied here, since that's the real shape of this crop.
+        out.add_roi(ROIChannel(
+            name='extraction_bounds',
+            polygons={'extraction_bounds': poly},
+            metadata={'source_sample': self.name, 'shape': 'polygon'}
+        ))
         return out
 
     def viewport(
