@@ -121,17 +121,48 @@ class SampleSet:
         for om_name, omic in self.omics.items():
             platform = omic.metadata.get('platform', 'visium')
             if platform == 'xenium':
-                coords = omic.data.obsm['spatial']
-                mask = (
-                    (coords[:, 0] >= min_x_um) & (coords[:, 0] <= max_x_um) &
-                    (coords[:, 1] >= min_y_um) & (coords[:, 1] <= max_y_um)
-                )
-                extracted = omic.data[mask].copy()
-                # Block index row ranges refer to the master slide — rebuild for this ROI.
-                if 'block_index' in extracted.uns:
+                import anndata as ad
+                from ..lazy_transcripts import LazyTranscripts
+
+                # Parent's block_index (mpp/chunk_px) is what the fresh index
+                # below gets rebuilt from -- grab it before it's out of reach,
+                # regardless of which branch produces `extracted`.
+                parent_uns = omic.data.uns if hasattr(omic.data, 'uns') else {}
+                parent_block_index = parent_uns.get('block_index')
+
+                if isinstance(omic.data, LazyTranscripts):
+                    # Lazy parent -- only materialize the blocks overlapping this
+                    # crop, not the whole (possibly much larger) source section.
+                    hit_ranges = omic.data.row_ranges_for_block_index(
+                        min_x_um, max_x_um, min_y_um, max_y_um
+                    )
+                    df = omic.data.materialize(hit_ranges)
+                    mask = (
+                        (df['x'].to_numpy() >= min_x_um) & (df['x'].to_numpy() <= max_x_um) &
+                        (df['y'].to_numpy() >= min_y_um) & (df['y'].to_numpy() <= max_y_um)
+                    )
+                    df = df.loc[mask].reset_index(drop=True)
+                    df.index = df.index.astype(str)
+                    extracted = ad.AnnData(obs=df)
+                    extracted.obsm['spatial'] = df[['x', 'y']].to_numpy()
+                else:
+                    coords = omic.data.obsm['spatial']
+                    mask = (
+                        (coords[:, 0] >= min_x_um) & (coords[:, 0] <= max_x_um) &
+                        (coords[:, 1] >= min_y_um) & (coords[:, 1] <= max_y_um)
+                    )
+                    extracted = omic.data[mask].copy()
+
+                # Block index row ranges always refer to the pre-crop source
+                # (master slide, or whatever the lazily-loaded parent covered),
+                # never the crop itself -- always rebuild fresh here rather than
+                # only when `extracted` happened to inherit one, since the
+                # lazy-materialize branch above starts from a bare new AnnData
+                # with no uns of its own.
+                if parent_block_index:
                     import json
                     from ..io_utils import build_spatial_block_index
-                    bi = json.loads(extracted.uns['block_index'])
+                    bi = json.loads(parent_block_index)
                     extracted = build_spatial_block_index(
                         extracted, mpp=bi['mpp'], chunk_px=bi['chunk_px'], gene_col='feature'
                     )
