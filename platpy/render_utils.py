@@ -256,6 +256,55 @@ def render_omic_grayscale(
         spatial_meta=SpatialMetadata()
     )
 
+def _precomputed_p_hi(omic: OmicChannel, gene_name, target_extent, target_shape,
+                       bin_um, percentile: float):
+    """
+    Look up a gene's contrast reference point from transcript_display_stats
+    (built once at save time, see io_utils.py) instead of computing it fresh
+    from whatever happens to be in the current viewport -- a section-wide
+    percentile, not a this-render-only one, so the same gene doesn't look
+    wildly different in brightness depending on where you're currently
+    looking (a sparse corner's local 99th percentile is noisy/misleading in
+    a way the section's real one isn't). Also means a sane default contrast
+    setting can be computed before ever rendering anything.
+
+    Returns None (caller falls back to the old from-raster computation) if:
+    stats aren't present (older bundle), gene_name is None (the table is
+    per-gene -- an "all genes" render has no single entry to use), or the
+    gene is in genes_reduced (too low-count for percentiles to mean much).
+
+    The stored percentile is a count-per-bin at whatever bin_um was used to
+    build the table (one fixed reference resolution, chosen once at save
+    time) -- rescaled by bin AREA ratio to the bin size this particular
+    render actually uses, since the same density produces a smaller count
+    per bin at a finer resolution.
+    """
+    if gene_name is None:
+        return None
+    data = omic.data
+    uns = getattr(data, 'uns', {}) if hasattr(data, 'uns') else {}
+    stats_json = uns.get('transcript_display_stats') if uns else None
+    if not stats_json:
+        return None
+
+    import json
+    from .io_utils import _TRANSCRIPT_DISPLAY_STATS_PCT_KEYS as PCT_KEYS
+    stats = json.loads(stats_json) if isinstance(stats_json, str) else stats_json
+    stored_bin_um = stats.get('bin_um')
+    gene_row = stats.get('genes', {}).get(gene_name)
+    if not stored_bin_um or gene_row is None:
+        return None  # no reference bin size, or gene is in genes_reduced / not in panel
+
+    gene_percentiles = gene_row[:len(PCT_KEYS)]
+    value = (float(gene_percentiles[PCT_KEYS.index(percentile)]) if percentile in PCT_KEYS
+             else float(np.interp(percentile, PCT_KEYS, gene_percentiles)))
+
+    left, right = target_extent[0], target_extent[1]
+    h, w = target_shape[:2]
+    render_bin_um = bin_um if (bin_um is not None and bin_um > 0) else abs(right - left) / w
+    return value * (render_bin_um / stored_bin_um) ** 2
+
+
 def render_omic_color_mapped(
     omic: OmicChannel, target_extent: Tuple[float, float, float, float], target_shape: Tuple[int, int],
     gene_name: str = None, cmap_name: str = 'plasma', percentile_clip: Tuple[float, float] = (1, 99),   #type:ignore
@@ -272,7 +321,9 @@ def render_omic_color_mapped(
     if valid.size == 0:
         norm_array = np.zeros_like(raw_array)
     else:
-        p_hi = float(np.percentile(valid, percentile_clip[1]))
+        p_hi = _precomputed_p_hi(omic, gene_name, target_extent, target_shape, bin_um, percentile_clip[1])
+        if p_hi is None:
+            p_hi = float(np.percentile(valid, percentile_clip[1]))
         p_hi = max(p_hi, 1.0)
         norm_array = np.clip(raw_array / p_hi, 0.0, 1.0).astype(np.float32)
         if gamma != 1.0:
