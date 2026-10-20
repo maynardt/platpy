@@ -42,7 +42,8 @@ def _encode_coord(val_um, precision=10):
 BUILD_CELLS_XENIUM_VERSION = 1
 
 
-def build_cells_xenium(sample, roi=None, force_recompute: bool = False, verbose: bool = True):
+def build_cells_xenium(sample, roi=None, discard_straddlers: bool = True,
+                        force_recompute: bool = False, verbose: bool = True):
     """
     Build a cells x genes AnnData from Xenium transcript data.
 
@@ -84,6 +85,20 @@ def build_cells_xenium(sample, roi=None, force_recompute: bool = False, verbose:
         when exact per-cell counts at the edges matter. Disables the
         save-time cache (which covers the whole bundle, not a sub-region) --
         force_recompute is implied whenever roi is given.
+    discard_straddlers : bool
+        Only meaningful when roi is given. True (default): drop any cell
+        whose boundary polygon isn't *entirely* inside the roi -- its full
+        vertex set, not just its centroid (a cell can have an in-bounds
+        centroid while still having vertices, and therefore transcripts,
+        outside the box). The alternative to dropping it is keeping it with
+        an undercounted expression profile, which is worse for most
+        analysis uses than just not having the cell. False keeps every cell
+        with any transcript in the roi, undercounted edges and all -- only
+        useful if you specifically want that tradeoff. Requires
+        sample.cells['cell_boundaries'].boundaries (the real per-vertex
+        polygon table); falls back to keeping straddlers (with a printed
+        notice when verbose) if that channel isn't present, since there's
+        nothing to test against.
     force_recompute : bool
         Skip the save-time cache (if any) and recompute from the raw
         transcripts every time.
@@ -135,6 +150,37 @@ def build_cells_xenium(sample, roi=None, force_recompute: bool = False, verbose:
     # Drop unassigned transcripts — Xenium uses 0 (int) or 'UNASSIGNED' (str)
     tx = tx[~tx['cell_id'].astype(str).isin(['0', '-1', 'UNASSIGNED'])]
     tx['cell_id'] = tx['cell_id'].astype(str)
+
+    if roi is not None and discard_straddlers:
+        boundary_chan = sample.cells.get('cell_boundaries')
+        if boundary_chan is None or boundary_chan.boundaries is None:
+            if verbose:
+                print("discard_straddlers=True requested but no cell_boundaries "
+                      "channel is present -- keeping straddler cells (undercounted).")
+        else:
+            min_x, max_x, min_y, max_y = roi
+            b = boundary_chan.boundaries
+            b_obs = b.obs if hasattr(b, 'obs') else b
+            # A cell's full polygon is inside the roi only if EVERY vertex is --
+            # a vectorized per-cell min/max is equivalent to that (and far
+            # cheaper than a groupby().apply() over every vertex) since "all
+            # vertices within [min_x,max_x]x[min_y,max_y]" <=> "the vertex
+            # bounding box is within it".
+            vbounds = b_obs.groupby('cell_id', observed=True).agg(
+                vx_min=('x', 'min'), vx_max=('x', 'max'),
+                vy_min=('y', 'min'), vy_max=('y', 'max'),
+            )
+            whole = vbounds[
+                (vbounds['vx_min'] >= min_x) & (vbounds['vx_max'] <= max_x) &
+                (vbounds['vy_min'] >= min_y) & (vbounds['vy_max'] <= max_y)
+            ]
+            keep_ids = set(whole.index.astype(str))
+            n_before = tx['cell_id'].nunique()
+            tx = tx[tx['cell_id'].isin(keep_ids)]
+            if verbose:
+                n_after = tx['cell_id'].nunique()
+                print(f"Discarded {n_before - n_after:,} straddler cell(s) "
+                      f"(boundary polygon not entirely inside roi) of {n_before:,}.")
 
     # Drop Xenium internal codewords (not real genes)
     codeword_mask = tx['feature'].str.contains(
