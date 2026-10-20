@@ -36,6 +36,24 @@ class CellChannel(BaseChannel):
                                         # `boundaries`; kept alongside it so callers get an O(1)
                                         # per-cell lookup instead of a groupby every time.
 
+    def __getattribute__(self, name):
+        # .data and .boundaries can be a lazy_value.Deferred (load_sample()
+        # defers both -- see its cells-loading section) rather than the real
+        # AnnData/DataFrame, so that opening a bundle doesn't pay for a
+        # per-vertex polygon table or a cached cell x gene matrix nobody
+        # asked for. Resolving (and caching the result in place) here, on
+        # *any* access to these two attributes, makes that transparent --
+        # code reading cell_chan.data/.boundaries directly (every existing
+        # caller, including anything outside platpy itself) gets the real
+        # object automatically, not a wrapper it has to know to unwrap.
+        value = object.__getattribute__(self, name)
+        if name in ('data', 'boundaries'):
+            from ..lazy_value import Deferred
+            if isinstance(value, Deferred):
+                value = value.resolve()
+                object.__setattr__(self, name, value)
+        return value
+
     # ------------------------------------------------------------------
     # Identity plot
     # ------------------------------------------------------------------

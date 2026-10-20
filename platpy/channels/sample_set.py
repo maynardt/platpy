@@ -189,9 +189,11 @@ class SampleSet:
         margin_min_x, margin_max_x = min_x_um - cell_margin_um, max_x_um + cell_margin_um
         margin_min_y, margin_max_y = min_y_um - cell_margin_um, max_y_um + cell_margin_um
 
+        from ..lazy_value import resolve as _resolve_lazy
+
         out.cells = {}
         for cell_name, cell_chan in self.cells.items():
-            b = cell_chan.boundaries
+            b = _resolve_lazy(cell_chan.boundaries)
             b_obs = _boundary_obs(b)
             if b_obs is not None and {'cell_id', 'x', 'y'}.issubset(b_obs.columns):
                 # Boundaries are one row per polygon *vertex* -- filter by whole

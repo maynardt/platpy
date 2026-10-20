@@ -113,14 +113,29 @@ def build_cells_xenium(sample, roi=None, discard_straddlers: bool = True,
               n_transcripts, n_genes
         obsm['spatial'] : (n_cells, 2) centroid coordinates in microns
     """
+    from .lazy_value import resolve as _resolve_lazy
+
     boundary_chan = sample.cells.get('cell_boundaries')
-    if roi is None and not force_recompute and boundary_chan is not None and boundary_chan.data is not None:
-        cached_version = boundary_chan.data.uns.get('build_cells_xenium_version')
+    # Only resolve the cached .data if it's actually going to be used -- a
+    # plain `boundary_chan.data is not None` check would already force the
+    # resolve as a side effect of the attribute access itself (CellChannel's
+    # __getattribute__ resolves transparently on *any* read), which would
+    # defeat the point of it being deferred for exactly the roi=/
+    # force_recompute=True calls that were never going to touch it. Peek the
+    # raw stored value via object.__getattribute__ (bypassing that
+    # transparency on purpose, just for this existence check) instead --
+    # True for either an unresolved Deferred or an already-resolved AnnData,
+    # same as `is not None` would have meant, just without forcing the read.
+    has_cached_data = (boundary_chan is not None
+                        and object.__getattribute__(boundary_chan, 'data') is not None)
+    if roi is None and not force_recompute and has_cached_data:
+        cached_data = boundary_chan.data  # intentional resolve -- we're using it now
+        cached_version = cached_data.uns.get('build_cells_xenium_version')
         if cached_version == BUILD_CELLS_XENIUM_VERSION:
             if verbose:
                 print(f"Using cell x gene matrix cached at save time "
-                      f"({boundary_chan.data.n_obs:,} cells x {boundary_chan.data.n_vars:,} genes).")
-            return boundary_chan.data
+                      f"({cached_data.n_obs:,} cells x {cached_data.n_vars:,} genes).")
+            return cached_data
         elif verbose:
             print(f"Cached cell x gene matrix is from an older platpy "
                   f"(version {cached_version}, current {BUILD_CELLS_XENIUM_VERSION}) -- recomputing.")
@@ -159,7 +174,7 @@ def build_cells_xenium(sample, roi=None, discard_straddlers: bool = True,
                       "channel is present -- keeping straddler cells (undercounted).")
         else:
             min_x, max_x, min_y, max_y = roi
-            b = boundary_chan.boundaries
+            b = _resolve_lazy(boundary_chan.boundaries)
             b_obs = b.obs if hasattr(b, 'obs') else b
             # A cell's full polygon is inside the roi only if EVERY vertex is --
             # a vectorized per-cell min/max is equivalent to that (and far

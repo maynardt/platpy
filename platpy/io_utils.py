@@ -579,12 +579,17 @@ def save_sample(
             logger.info(f"  + Built default cell x gene matrix "
                         f"({default_cells.n_obs:,} cells x {default_cells.n_vars:,} genes)")
 
+        from .lazy_value import resolve as _resolve_lazy
+
         for name, cell_chan in sample.cells.items():
             dest_path = cells_dir / f"{name}.zarr"
             if overwrite and dest_path.exists():
                 shutil.rmtree(dest_path, onexc=_remove_readonly)
-                
-            adata: Any = cell_chan.boundaries
+
+            # A resave always needs the real boundaries/data regardless of
+            # whether anything touched them yet -- write_zarr() needs actual
+            # bytes either way, so there's no deferred-write equivalent here.
+            adata: Any = _resolve_lazy(cell_chan.boundaries)
             if isinstance(adata, pd.DataFrame):
                 df_obs = adata.reset_index(drop=True)
                 df_obs.index = df_obs.index.astype(str)
@@ -609,12 +614,13 @@ def save_sample(
             # own zarr since it's one row per cell, a different row count than
             # the per-vertex boundaries table.
             if cell_chan.data is not None:
+                cell_data = _resolve_lazy(cell_chan.data)
                 data_path = cells_dir / f"{name}_cells.zarr"
                 if overwrite and data_path.exists():
                     shutil.rmtree(data_path, onexc=_remove_readonly)
-                cell_chan.data.write_zarr(data_path)
+                cell_data.write_zarr(data_path)
                 logger.info(f"  + Saved Cell x Gene Matrix: {name} "
-                            f"({cell_chan.data.n_obs:,} cells x {cell_chan.data.n_vars:,} genes)")
+                            f"({cell_data.n_obs:,} cells x {cell_data.n_vars:,} genes)")
 
             logger.info(f"  + Saved Cell Channel: {name}")
 
@@ -821,6 +827,9 @@ def load_sample(in_path_str: str, verbose: bool = True, load_2um_bin: bool = Fal
 
     cells_dir = in_path / "cells"
     if cells_dir.exists():
+        from .lazy_value import Deferred
+        from .lazy_transcripts import read_zarr_scalar_dict
+
         for cell_path in cells_dir.glob("*.zarr"):
             # {name}_cells.zarr is the cached default cell x gene matrix for
             # the "{name}" channel this loop is building, not a boundary
@@ -828,12 +837,24 @@ def load_sample(in_path_str: str, verbose: bool = True, load_2um_bin: bool = Fal
             if cell_path.stem.endswith('_cells'):
                 continue
             name = cell_path.stem
-            adata = ad.read_zarr(cell_path)
-            spatial_mat = np.array(adata.uns.get('spatial_meta', np.eye(3)))
+
+            # Neither .boundaries (a per-vertex polygon table that can run to
+            # tens-hundreds of MB) nor .data (the cached cell x gene matrix)
+            # get loaded here -- only something that actually touches them
+            # should pay for it. spatial_meta/channel_meta are still needed
+            # up front though, so peek them cheaply (a 3x3 array, a handful
+            # of scalars) directly via zarr rather than through ad.read_zarr(),
+            # which would materialize the whole vertex table just to read a
+            # few small uns entries.
+            probe_root = zarr.open_group(str(cell_path), mode='r')
+            probe_uns = probe_root['uns'] if 'uns' in probe_root else None
+            spatial_mat = (np.array(probe_uns['spatial_meta'][()])
+                           if probe_uns is not None and 'spatial_meta' in probe_uns else np.eye(3))
+            channel_meta = (read_zarr_scalar_dict(probe_uns['channel_meta'])
+                            if probe_uns is not None and 'channel_meta' in probe_uns else {})
             spatial = SpatialMetadata(transform_matrix=spatial_mat)
 
-            # FIX: Restore the channel metadata
-            channel_meta = adata.uns.get('channel_meta', {})
+            boundaries = Deferred(loader=lambda p=cell_path: ad.read_zarr(p))
 
             summary_path = cells_dir / f"{name}_summary.parquet"
             summary = pd.read_parquet(summary_path) if summary_path.exists() else None
@@ -842,14 +863,19 @@ def load_sample(in_path_str: str, verbose: bool = True, load_2um_bin: bool = Fal
             # build_default_cells). Built once at save time and never mutated
             # afterward, so skipping AnnData's O(n) obs-index uniqueness check
             # on reload is safe by construction -- the index was already
-            # validated the one time it was created.
+            # validated the one time it was created. check_uniqueness=False
+            # only needs to apply while THIS load actually runs, not globally,
+            # so it's set inside the deferred loader itself rather than around
+            # this whole function.
             data_path = cells_dir / f"{name}_cells.zarr"
             data = None
             if data_path.exists():
-                with ad.settings.override(check_uniqueness=False):
-                    data = ad.read_zarr(data_path)
+                def _load_cell_data(p=data_path):
+                    with ad.settings.override(check_uniqueness=False):
+                        return ad.read_zarr(p)
+                data = Deferred(loader=_load_cell_data)
 
-            cell_chan = CellChannel(name=name, boundaries=adata, data=data, summary=summary,
+            cell_chan = CellChannel(name=name, boundaries=boundaries, data=data, summary=summary,
                                      spatial_meta=spatial, metadata=channel_meta)
             sample.cells[name] = cell_chan
 
