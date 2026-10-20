@@ -9,7 +9,7 @@ import pandas as pd
 import dask.array as da
 import zarr
 import anndata as ad
-from typing import Optional, Any, Dict
+from typing import Optional, Any, Dict, Tuple
 
 
 # platpy imports
@@ -427,60 +427,84 @@ def save_sample(
 
     if sample.images:
         morph_path = out_path / "morph.zarr"
-        
+
         # Explicitly remove existing morph directory if overwrite is enabled
         if overwrite and morph_path.exists():
             shutil.rmtree(morph_path, onexc=_remove_readonly)
-        
+
         morph_path.mkdir(parents=True, exist_ok=True)
-        
+
+        import ome_zarr.writer as ome_writer
+        import ome_zarr.format as ome_format
+
+        root: Any = zarr.open_group(str(morph_path), mode='a')  # type: ignore
+        # ome_zarr's write_multiscale() still passes a singular 'compressor'
+        # through to da.to_zarr() (not yet updated for zarr's current
+        # 'compressors' kwarg -- confirmed harmless, just a deprecation
+        # warning, nothing platpy can fix on its own side).
+        ome_compressor = compressors[0]
+
         for name, img_chan in sample.images.items():
             img_data = img_chan.image
-            
-            root: Any = zarr.open_group(str(morph_path), mode='a') # type: ignore
-            chunks = (1024, 1024, 3) if img_data.ndim == 3 else (1024, 1024)
-            z = root.require_dataset(
-                name, shape=img_data.shape, chunks=chunks,
-                dtype=img_data.dtype, overwrite=True, compressors=compressors
+            is_rgb = img_data.ndim == 3
+            # OME-NGFF requires non-space axes before space axes -- 'c' must
+            # come before 'y'/'x', the reverse of platpy's own (H, W, C)
+            # convention, so the array itself needs moveaxis'ing to match,
+            # not just the axes label list.
+            axes = ['c', 'y', 'x'] if is_rgb else ['y', 'x']
+            chunks = (3, 1024, 1024) if is_rgb else (1024, 1024)
+
+            base_mpp = float(img_chan.spatial_meta.transform_matrix[0, 0])
+            tx = float(img_chan.spatial_meta.transform_matrix[0, 2])
+            ty = float(img_chan.spatial_meta.transform_matrix[1, 2])
+
+            def _to_ome_axes(arr):
+                return da.moveaxis(arr, -1, 0) if (is_rgb and isinstance(arr, da.Array)) else (
+                    np.moveaxis(arr, -1, 0) if is_rgb else arr)
+
+            # Base level + persisted pyramid levels (skipped when
+            # persist_pyramid=False, e.g. Xenium channels that already have
+            # _hires/_lowres companions acting as the pyramid), largest/finest
+            # first -- write_multiscale()'s required order.
+            levels = {base_mpp: img_data}
+            if img_chan.persist_pyramid:
+                levels.update(img_chan.pyramid)
+            sorted_mpps = sorted(levels.keys())
+            pyramid_arrays = [_to_ome_axes(levels[m]) for m in sorted_mpps]
+
+            coordinate_transformations = []
+            for mpp in sorted_mpps:
+                scale = [1.0, mpp, mpp] if is_rgb else [mpp, mpp]
+                translation = [0.0, ty, tx] if is_rgb else [ty, tx]
+                coordinate_transformations.append([
+                    {'type': 'scale', 'scale': scale},
+                    {'type': 'translation', 'translation': translation},
+                ])
+
+            if overwrite and name in root:
+                del root[name]
+            chan_group = root.require_group(name)
+            ome_writer.write_multiscale(
+                pyramid=pyramid_arrays,
+                group=chan_group,
+                fmt=ome_format.FormatV05(),
+                axes=axes,
+                coordinate_transformations=coordinate_transformations,
+                storage_options={'chunks': chunks, 'compressor': ome_compressor},
             )
-            if isinstance(img_data, da.Array):
-                da.store(img_data, z)
-            else:
-                z[:] = img_data
-            
-            safe_matrix = np.array(img_chan.spatial_meta.transform_matrix).tolist()
-            meta_dict = {
-                'transform_matrix': safe_matrix,
-                'local_bounds': img_chan.spatial_meta.local_bounds,
+
+            # Non-standard extras platpy still needs, alongside the 'ome' key
+            # write_multiscale() already wrote above -- the spec permits
+            # additional attrs it doesn't define, so these just ride along.
+            chan_group.attrs['platpy_meta'] = _sanitize_for_zarr({
                 'unit': img_chan.spatial_meta.unit,
                 'name': img_chan.name,
                 'base_layer': img_chan.base_layer,
-                'user_metadata': img_chan.metadata
-            }
-            root[name].attrs.put(meta_dict) # type: ignore
+                'user_metadata': img_chan.metadata,
+            })
 
-            # Save pre-computed pyramid levels so renders don't re-derive from full-res.
-            # Skipped when persist_pyramid=False (e.g. Xenium channels that already have
-            # _hires/_lowres companions acting as the pyramid).
-            # Key format: {name}__pyr{factor} where factor = 2, 4, 8, ...
-            base_mpp = img_chan.spatial_meta.transform_matrix[0, 0]
-            for level_mpp, level_arr in img_chan.pyramid.items():
-                if abs(level_mpp - base_mpp) < 1e-9:
-                    continue  # skip base level — already saved as the main component
-                factor = round(level_mpp / base_mpp)
-                pyr_key = f"{name}__pyr{factor}"
-                pyr_chunks = (1024, 1024, 3) if level_arr.ndim == 3 else (1024, 1024)
-                zp = root.require_dataset(
-                    pyr_key, shape=level_arr.shape, chunks=pyr_chunks,
-                    dtype=level_arr.dtype, overwrite=True, compressors=compressors
-                )
-                if isinstance(level_arr, da.Array):
-                    da.store(level_arr, zp)
-                else:
-                    zp[:] = level_arr
-                root[pyr_key].attrs.put({'mpp': float(level_mpp)})
-
-            logger.info(f"  + Saved Image: {name} ({len(img_chan.pyramid)} pyramid level(s), clevel={clevel})")
+            logger.info(f"  + Saved Image (OME-Zarr 0.5): {name} "
+                        f"({len(pyramid_arrays)} level(s), clevel={clevel})")
 
     # ========
     # 2. Save Omics (omics/{name}/ pyramid directory, one zarr per level)
@@ -679,38 +703,64 @@ def load_sample(in_path_str: str, verbose: bool = True, load_2um_bin: bool = Fal
     morph_path = in_path / "morph.zarr"
     summary_list = []
     if morph_path.exists():
+        from .transform_utils import create_transform_matrix
+
         # Open with mode='r' (zarr auto-detects version on read)
         root: Any = zarr.open_group(str(morph_path), mode='r') # type: ignore
-        for name in root.array_keys():
-            if '__pyr' in name:
-                continue  # pyramid level — attached to parent channel below
-            z_arr = root[name]
-            d_arr = da.from_zarr(z_arr)
+        for name in root.group_keys():
+            chan_group = root[name]
+            ome_meta = chan_group.attrs.get('ome', {}).get('multiscales', [{}])[0]
+            platpy_meta = chan_group.attrs.get('platpy_meta', {})
+            axes = [a['name'] for a in ome_meta.get('axes', [{'name': 'y'}, {'name': 'x'}])]
+            y_idx, x_idx = axes.index('y'), axes.index('x')
+            c_idx = axes.index('c') if 'c' in axes else None
+
+            # Parse every dataset entry once into (mpp -> (array, tx, ty)) --
+            # avoids a second pass to recover the base level's own translation.
+            # Arrays get moveaxis'd back to platpy's native (y, x[, c]) order
+            # here too -- OME-NGFF requires 'c' before the space axes, the
+            # reverse of platpy's own (H, W, C) convention -- so every other
+            # line below can just assume that native order, not OME's.
+            levels: Dict[float, Any] = {}
+            translations: Dict[float, Tuple[float, float]] = {}
+            for ds in ome_meta.get('datasets', []):
+                xforms = {t['type']: t for t in ds['coordinateTransformations']}
+                mpp = float(xforms['scale']['scale'][x_idx])
+                translation = xforms['translation']['translation']
+                arr = da.from_zarr(chan_group[ds['path']])
+                if c_idx is not None:
+                    arr = da.moveaxis(arr, c_idx, -1)
+                levels[mpp] = arr
+                translations[mpp] = (float(translation[x_idx]), float(translation[y_idx]))
+
+            if not levels:
+                continue  # malformed/empty channel group -- nothing to load
+
+            base_mpp = min(levels.keys())
+            d_arr = levels[base_mpp]
             info_str = _get_channel_info_string(d_arr)
             summary_list.append(f"'{name}' ({info_str})")
-            
-            attrs = z_arr.attrs.asdict() # type: ignore
+            tx, ty = translations[base_mpp]
+
+            h_px, w_px = d_arr.shape[0], d_arr.shape[1]
             spatial = SpatialMetadata(
-                transform_matrix=np.array(attrs.get('transform_matrix', np.eye(3))),
-                local_bounds=attrs.get('local_bounds'),
-                unit=attrs.get('unit', 'microns')
+                transform_matrix=create_transform_matrix(scale_x=base_mpp, scale_y=base_mpp, tx=tx, ty=ty),
+                local_bounds=(0.0, float(w_px), 0.0, float(h_px)),
+                unit=platpy_meta.get('unit', 'microns')
             )
             img_chan = ImageChannel(
-                name=attrs.get('name', name),
+                name=platpy_meta.get('name', name),
                 image=d_arr,
                 spatial_meta=spatial,
-                metadata=attrs.get('user_metadata', {})
+                metadata=platpy_meta.get('user_metadata', {})
             )
-            img_chan.base_layer = attrs.get('base_layer', None)
+            img_chan.base_layer = platpy_meta.get('base_layer', None)
 
-            # Load pre-computed pyramid levels if saved; otherwise generate on-the-fly.
-            pyr_keys = [k for k in root.array_keys() if k.startswith(f"{name}__pyr")]
-            if pyr_keys:
-                for pyr_key in pyr_keys:
-                    level_mpp = root[pyr_key].attrs.asdict().get('mpp')
-                    if level_mpp is not None:
-                        img_chan.pyramid[float(level_mpp)] = da.from_zarr(root[pyr_key])
-            else:
+            for mpp, level_arr in levels.items():
+                if abs(mpp - base_mpp) < 1e-9:
+                    continue  # base level — already img_chan.image
+                img_chan.pyramid[mpp] = level_arr
+            if not img_chan.pyramid:
                 img_chan.generate_pyramid()
 
             sample.images[name] = img_chan
