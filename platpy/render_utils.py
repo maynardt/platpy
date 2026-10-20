@@ -78,6 +78,9 @@ def create_new_image(
     width_px  = int(np.ceil((max_x - min_x) / resolution))
     height_px = int(np.ceil((max_y - min_y) / resolution))
 
+    if background_color is None:
+        background_color = 'transparent'
+
     color_map = {'black': 0, 'white': 255}
     fill_val = color_map.get(background_color.lower(), 0)
     canvas = np.full((height_px, width_px, 4), fill_val, dtype=np.uint8)
