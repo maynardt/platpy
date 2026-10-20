@@ -130,6 +130,21 @@ class LazyTranscripts:
         })
 
 
+def read_zarr_scalar_dict(group: zarr.Group) -> Dict:
+    """
+    Read a flat zarr group of 0-d scalar arrays (e.g. uns/channel_meta) into
+    a plain dict, without going through AnnData. Cheap regardless of how
+    large the surrounding array data is -- these groups hold a handful of
+    small values (platform, is_continuous, total_transcripts, etc).
+    """
+    out = {}
+    for key in group.array_keys():
+        arr = group[key]
+        val = arr[()]
+        out[key] = val.item() if (hasattr(val, 'item') and arr.shape == ()) else val
+    return out
+
+
 def _read_lazy_categorical(group: zarr.Group) -> LazyCategorical:
     categories = group['categories'][:]
     codes = da.from_zarr(group['codes'])
@@ -154,18 +169,7 @@ def load_transcripts_lazy(zarr_path) -> LazyTranscripts:
     feature = _read_lazy_categorical(obs['feature'])
     cell_id = _read_lazy_categorical(obs['cell_id'])
 
-    uns = {}
-    if 'uns' in root:
-        for key in root['uns'].array_keys():
-            arr = root['uns'][key]
-            val = arr[()]
-            # Only 0-d (true scalar) entries get unwrapped to a plain Python
-            # value (block_index's JSON string, the opt_*_version ints, etc).
-            # Multi-element arrays (e.g. spatial_meta's 3x3 transform matrix)
-            # aren't something LazyTranscripts needs -- load_sample() reads
-            # those directly off the zarr group itself -- so keep them as-is
-            # rather than erroring on .item().
-            uns[key] = val.item() if (hasattr(val, 'item') and arr.shape == ()) else val
+    uns = read_zarr_scalar_dict(root['uns']) if 'uns' in root else {}
 
     return LazyTranscripts(
         n_obs=n_obs, x=x, y=y, qv=qv, transcript_id=transcript_id,

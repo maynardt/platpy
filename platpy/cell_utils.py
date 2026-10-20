@@ -42,7 +42,7 @@ def _encode_coord(val_um, precision=10):
 BUILD_CELLS_XENIUM_VERSION = 1
 
 
-def build_cells_xenium(sample, force_recompute: bool = False, verbose: bool = True):
+def build_cells_xenium(sample, roi=None, force_recompute: bool = False, verbose: bool = True):
     """
     Build a cells x genes AnnData from Xenium transcript data.
 
@@ -70,6 +70,20 @@ def build_cells_xenium(sample, force_recompute: bool = False, verbose: bool = Tr
     sample : SampleSet
         Loaded Xenium sample.  Must have sample.omics['transcripts'] with obs
         columns: cell_id, feature, x, y.
+    roi : (min_x_um, max_x_um, min_y_um, max_y_um) or None
+        Restrict to transcripts in this bbox -- for a lazily-loaded sample
+        (see lazy_transcripts.py), only the overlapping spatial blocks are
+        ever materialized, not the whole section. No margin/buffer around
+        the box (unlike extract_roi()'s cell_margin_um): a cell whose body
+        straddles the boundary only gets counted for the transcripts that
+        landed inside the box, so its gene counts come out undercounted
+        relative to a full-bundle build -- its centroid/area (from the real
+        instrument polygon, unaffected by this) can also end up just outside
+        the box for the same reason. Fine for "give me approximate cells in
+        this region" use; not a substitute for extract_roi() + a full build
+        when exact per-cell counts at the edges matter. Disables the
+        save-time cache (which covers the whole bundle, not a sub-region) --
+        force_recompute is implied whenever roi is given.
     force_recompute : bool
         Skip the save-time cache (if any) and recompute from the raw
         transcripts every time.
@@ -85,7 +99,7 @@ def build_cells_xenium(sample, force_recompute: bool = False, verbose: bool = Tr
         obsm['spatial'] : (n_cells, 2) centroid coordinates in microns
     """
     boundary_chan = sample.cells.get('cell_boundaries')
-    if not force_recompute and boundary_chan is not None and boundary_chan.data is not None:
+    if roi is None and not force_recompute and boundary_chan is not None and boundary_chan.data is not None:
         cached_version = boundary_chan.data.uns.get('build_cells_xenium_version')
         if cached_version == BUILD_CELLS_XENIUM_VERSION:
             if verbose:
@@ -97,7 +111,26 @@ def build_cells_xenium(sample, force_recompute: bool = False, verbose: bool = Tr
                   f"(version {cached_version}, current {BUILD_CELLS_XENIUM_VERSION}) -- recomputing.")
 
     # Pull only the columns we need to keep memory footprint small
-    tx = sample.omics['transcripts'].data.obs[['cell_id', 'feature', 'x', 'y']].copy()
+    from .lazy_transcripts import LazyTranscripts
+    tx_data = sample.omics['transcripts'].data
+
+    if isinstance(tx_data, LazyTranscripts):
+        if roi is not None:
+            min_x, max_x, min_y, max_y = roi
+            hit_ranges = tx_data.row_ranges_for_block_index(min_x, max_x, min_y, max_y)
+            tx = tx_data.materialize(hit_ranges)
+            tx = tx[(tx['x'] >= min_x) & (tx['x'] <= max_x) &
+                    (tx['y'] >= min_y) & (tx['y'] <= max_y)]
+        else:
+            tx = tx_data.materialize()
+        tx = tx[['cell_id', 'feature', 'x', 'y']].copy()
+    else:
+        # Non-lazy fallback (in-memory-constructed data, older bundles, etc.)
+        tx = tx_data.obs[['cell_id', 'feature', 'x', 'y']].copy()
+        if roi is not None:
+            min_x, max_x, min_y, max_y = roi
+            tx = tx[(tx['x'] >= min_x) & (tx['x'] <= max_x) &
+                    (tx['y'] >= min_y) & (tx['y'] <= max_y)]
 
     # Drop unassigned transcripts — Xenium uses 0 (int) or 'UNASSIGNED' (str)
     tx = tx[~tx['cell_id'].astype(str).isin(['0', '-1', 'UNASSIGNED'])]
