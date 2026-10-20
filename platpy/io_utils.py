@@ -31,7 +31,6 @@ ad.settings.zarr_write_format = 3
 # the presence-checks already use -- not a breaking change for older files.
 PLATPY_FORMAT_VERSION = 1
 OPT_BLOCK_INDEX_VERSION = 1
-OPT_NAME_OFFSET_VERSION = 1
 OPT_TRANSCRIPT_DISPLAY_STATS_VERSION = 1
 
 
@@ -96,22 +95,6 @@ def build_spatial_block_index(adata, mpp, chunk_px=1024, gene_col=None):
         for k in range(len(starts))
     ]
 
-    # Add coarse gene name-prefix index within each block (Xenium only — gene_col must be set).
-    # Genes are already sorted alphabetically within each block, so searchsorted finds boundaries
-    # in O(log n) at query time with zero extra storage overhead beyond these small per-block dicts.
-    if gene_col is not None:
-        gene_vals = adata_sorted.obs[gene_col].values
-        for b in blocks:
-            genes = gene_vals[b['row_start']:b['row_end']]
-            letters = sorted(set(g[0].upper() for g in genes if g))
-            b['name_offsets'] = {
-                letter: (
-                    int(np.searchsorted(genes, letter)),
-                    int(np.searchsorted(genes, chr(ord(letter) + 1), 'left'))
-                )
-                for letter in letters
-            }
-
     # Store as a JSON string — AnnData's zarr backend converts list-of-dicts
     # entries in uns to str() representations (single quotes, not JSON-compatible).
     # A single string value round-trips correctly through zarr.
@@ -126,8 +109,6 @@ def build_spatial_block_index(adata, mpp, chunk_px=1024, gene_col=None):
     # though both features are built right here, so each can be bumped/tested on its
     # own without disturbing the other.
     adata_sorted.uns['opt_block_index_version'] = OPT_BLOCK_INDEX_VERSION
-    if gene_col is not None:
-        adata_sorted.uns['opt_name_offset_version'] = OPT_NAME_OFFSET_VERSION
     return adata_sorted
 
 
@@ -527,6 +508,30 @@ def save_sample(
             platform = omic_chan.metadata.get('platform', 'visium')
             stats_bin_um = _derive_transcript_display_stats_bin_um(sample, omic_chan) if platform == 'xenium' else None
 
+            # Normalize every pyramid level to a real AnnData up front -- write_zarr
+            # needs real data regardless, and a LazyTranscripts level (a sample
+            # loaded lazily and resaved without ever being cropped) only gets
+            # materialized once here, reused below for both the stats reference
+            # level and the actual write, rather than pulling the full table from
+            # zarr twice. A plain resave's row order/blocks are unchanged from the
+            # original load, so the existing block_index (and anything else in
+            # LazyTranscripts.uns) carries straight over instead of being rebuilt.
+            from .lazy_transcripts import LazyTranscripts
+            normalized_pyramid = {}
+            for bin_um, level_data in omic_chan.pyramid.items():
+                if isinstance(level_data, LazyTranscripts):
+                    df = level_data.materialize()
+                    df.index = df.index.astype(str)
+                    level_adata = ad.AnnData(obs=df)
+                    level_adata.obsm['spatial'] = df[['x', 'y']].to_numpy()
+                    for k, v in level_data.uns.items():
+                        level_adata.uns[k] = v
+                elif isinstance(level_data, pd.DataFrame):
+                    level_adata = ad.AnnData(obs=level_data)
+                else:
+                    level_adata = level_data
+                normalized_pyramid[bin_um] = level_adata
+
             # Compute transcript_display_stats ONCE from a single reference level, not once per
             # pyramid level -- otherwise each resolution's table would be individually
             # noisy (Visium's 4um bins in particular). Mirrors the image side's own
@@ -536,21 +541,17 @@ def save_sample(
             # above -- coarsest available today is 16um, so this lands on 8um).
             # For Xenium there's only ever one pyramid entry (the 0.0 flag) anyway.
             stats_table = None
-            if omic_chan.pyramid:
-                levels_sorted = sorted(omic_chan.pyramid.keys())
+            if normalized_pyramid:
+                levels_sorted = sorted(normalized_pyramid.keys())
                 ref_level = levels_sorted[0] if platform == 'xenium' else (
                     levels_sorted[-2] if len(levels_sorted) >= 2 else levels_sorted[-1]
                 )
-                ref_adata = omic_chan.pyramid[ref_level]
-                if isinstance(ref_adata, pd.DataFrame):
-                    ref_adata = ad.AnnData(obs=ref_adata)
+                ref_adata = normalized_pyramid[ref_level]
                 stats_table = build_transcript_display_stats_table(ref_adata, platform, bin_um=stats_bin_um)
                 if platform != 'xenium' and stats_table is not None:
                     stats_table['bin_um'] = float(ref_level)  # which spot-bin level was used
 
-            for bin_um, adata_level in omic_chan.pyramid.items():
-                if isinstance(adata_level, pd.DataFrame):
-                    adata_level = ad.AnnData(obs=adata_level)
+            for bin_um, adata_level in normalized_pyramid.items():
                 adata_level.uns['spatial_meta'] = spatial_list
                 adata_level.uns['channel_meta'] = channel_meta
 
