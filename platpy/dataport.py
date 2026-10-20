@@ -221,68 +221,44 @@ class DataPort:
                              buffer_um: float = 50.0):
         """AnnData extraction for transcript point-cloud platforms (Xenium, etc.).
 
-        Uses the spatial block index (built at load time) to narrow candidates to
-        the relevant blocks before doing a precise bbox filter.  Falls back to a
-        full scan if no block index is present.
+        channel.data is a lazy_transcripts.LazyTranscripts -- resolves the
+        query bbox to block_index row ranges (falls back to a full scan if no
+        block_index is present, same as before), materializes only those
+        rows, then does a precise bbox filter on that small in-memory result.
 
         buffer_um: expand the block-lookup bbox by this amount on all sides so
         transcripts near block edges (whose parent cell may straddle the boundary)
         are not missed.  50 µm ≈ 2-3 cell diameters — conservative but cheap.
+
+        Note: fine-alignment correction (spatial_fine) isn't wired up for the
+        lazy path yet -- always uses raw x/y. Mainly matters for Visium's
+        spot-grid-to-image registration; low-impact for Xenium's own
+        instrument-native coordinates, but a real gap if that changes.
         """
+        import anndata as ad
         import numpy as np
 
         min_x, max_x, min_y, max_y = self.roi_extent
-        adata = channel.data
+        lazy = channel.data
 
-        # --- Block index fast path ---
-        if 'block_index' in adata.uns:
-            from .io_utils import query_block_index
+        q_min_x, q_max_x = min_x - buffer_um, max_x + buffer_um
+        q_min_y, q_max_y = min_y - buffer_um, max_y + buffer_um
+        hit_ranges = lazy.row_ranges_for_block_index(q_min_x, q_max_x, q_min_y, q_max_y)
+        df = lazy.materialize(hit_ranges)
 
-            q_min_x = min_x - buffer_um
-            q_max_x = max_x + buffer_um
-            q_min_y = min_y - buffer_um
-            q_max_y = max_y + buffer_um
-
-            hit_ranges = query_block_index(adata.uns['block_index'], q_min_x, q_max_x, q_min_y, q_max_y)
-
-            if not hit_ranges:
-                empty = adata[np.array([], dtype=int)].copy()
-                empty.obs['x_micron'] = np.array([])
-                empty.obs['y_micron'] = np.array([])
-                return empty
-
-            # Build the fine-filter mask only over hit-block rows — avoids scanning
-            # all N rows while also avoiding an expensive intermediate AnnData slice.
-            use_fine = channel.use_fine_alignment
-            all_coords = (adata.obsm['spatial_fine']
-                          if ('spatial_fine' in adata.obsm and use_fine is not False)
-                          else adata.obsm['spatial'])
-            final_mask = np.zeros(len(adata), dtype=bool)
-            for row_start, row_end in hit_ranges:
-                c = all_coords[row_start:row_end]
-                final_mask[row_start:row_end] = (
-                    (c[:, 0] >= min_x) & (c[:, 0] <= max_x) &
-                    (c[:, 1] >= min_y) & (c[:, 1] <= max_y)
-                )
-        else:
-            # No block index — full scan fallback
-            use_fine = channel.use_fine_alignment
-            all_coords = (adata.obsm['spatial_fine']
-                          if ('spatial_fine' in adata.obsm and use_fine is not False)
-                          else adata.obsm['spatial'])
-            final_mask = (
-                (all_coords[:, 0] >= min_x) & (all_coords[:, 0] <= max_x) &
-                (all_coords[:, 1] >= min_y) & (all_coords[:, 1] <= max_y)
-            )
-
-        subset = adata[final_mask].copy()
-        active = all_coords[final_mask]
-        subset.obs['x_micron'] = active[:, 0]
-        subset.obs['y_micron'] = active[:, 1]
-
+        precise_mask = (
+            (df['x'].values >= min_x) & (df['x'].values <= max_x) &
+            (df['y'].values >= min_y) & (df['y'].values <= max_y)
+        )
+        df = df[precise_mask]
         if gene is not None:
-            subset = subset[subset.obs['feature'] == gene]
+            df = df[df['feature'] == gene]
 
+        df = df.reset_index(drop=True)
+        df.index = df.index.astype(str)
+        subset = ad.AnnData(obs=df)
+        subset.obs['x_micron'] = df['x'].to_numpy()
+        subset.obs['y_micron'] = df['y'].to_numpy()
         return subset
 
     # =========================================================================

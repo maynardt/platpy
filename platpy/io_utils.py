@@ -748,19 +748,51 @@ def load_sample(in_path_str: str, verbose: bool = True, load_2um_bin: bool = Fal
             if not level_files:
                 continue
 
+            # A single level stored at the 0.0 sentinel is how continuous point
+            # clouds (Xenium transcripts) are always saved (__post_init__ /
+            # save_sample()) -- Visium's real binned pyramids always have 2+
+            # levels. Peek channel_meta cheaply (a handful of scalars, not the
+            # row data) via zarr directly to confirm before committing to the
+            # lazy path -- ad.read_zarr() is exactly the eager read this is
+            # meant to avoid.
+            is_lazy_candidate = (
+                len(level_files) == 1
+                and _parse_bin_um(level_files[0]) == 0.0
+            )
+            if is_lazy_candidate:
+                from .lazy_transcripts import read_zarr_scalar_dict, load_transcripts_lazy
+                probe_root = zarr.open_group(str(level_files[0]), mode='r')
+                probe_meta = (read_zarr_scalar_dict(probe_root['uns']['channel_meta'])
+                              if 'uns' in probe_root and 'channel_meta' in probe_root['uns'] else {})
+                is_lazy_candidate = (probe_meta.get('platform') == 'xenium'
+                                      and bool(probe_meta.get('is_continuous')))
+
             pyramid: Dict[float, Any] = {}
             spatial_mat = np.eye(3)
             channel_meta: Dict[str, Any] = {}
-            for level_path in level_files:
-                bin_um = float(level_path.stem.replace('um', ''))
+
+            if is_lazy_candidate:
+                level_path = level_files[0]
                 try:
-                    adata = ad.read_zarr(level_path)
+                    lazy_data = load_transcripts_lazy(level_path)
                 except Exception as e:
-                    print(f"  [load_sample] WARNING: could not read {level_path.name} in {chan_dir.name}/ — skipping ({type(e).__name__}: {e})")
-                    continue
-                spatial_mat = np.array(adata.uns.get('spatial_meta', np.eye(3)))
-                channel_meta = adata.uns.get('channel_meta', {})
-                pyramid[bin_um] = adata
+                    print(f"  [load_sample] WARNING: could not lazily read {level_path.name} in {chan_dir.name}/ — skipping ({type(e).__name__}: {e})")
+                    lazy_data = None
+                if lazy_data is not None:
+                    spatial_mat = np.array(lazy_data.uns.get('spatial_meta', np.eye(3)))
+                    channel_meta = probe_meta
+                    pyramid[0.0] = lazy_data
+            else:
+                for level_path in level_files:
+                    bin_um = float(level_path.stem.replace('um', ''))
+                    try:
+                        adata = ad.read_zarr(level_path)
+                    except Exception as e:
+                        print(f"  [load_sample] WARNING: could not read {level_path.name} in {chan_dir.name}/ — skipping ({type(e).__name__}: {e})")
+                        continue
+                    spatial_mat = np.array(adata.uns.get('spatial_meta', np.eye(3)))
+                    channel_meta = adata.uns.get('channel_meta', {})
+                    pyramid[bin_um] = adata
 
             if not load_2um_bin and 2.0 in pyramid and 4.0 in pyramid:
                 del pyramid[2.0]
