@@ -32,7 +32,7 @@ ad.settings.zarr_write_format = 3
 PLATPY_FORMAT_VERSION = 1
 OPT_BLOCK_INDEX_VERSION = 1
 OPT_NAME_OFFSET_VERSION = 1
-OPT_TRANSCRIPT_ALPHA_VERSION = 1
+OPT_TRANSCRIPT_DISPLAY_STATS_VERSION = 1
 
 
 def build_spatial_block_index(adata, mpp, chunk_px=1024, gene_col=None):
@@ -131,13 +131,13 @@ def build_spatial_block_index(adata, mpp, chunk_px=1024, gene_col=None):
     return adata_sorted
 
 
-# Percentile ticks for the transcript_alpha table. Coarser than the image side's
+# Percentile ticks for the transcript_display_stats table. Coarser than the image side's
 # 16-point display_stats (which is one array total per image) since this multiplies
 # per-gene and panels can run to thousands of genes. Zeros are dropped before
 # computing percentiles -- this is a *display* table, not an analysis statistic,
 # so dynamic range shouldn't depend on how much non-expressing "blank space"
 # surrounds the signal, mirroring the image side's own zero-pixel exclusion.
-_TRANSCRIPT_ALPHA_PCT_KEYS = [0.1, 1, 5, 25, 50, 95, 99, 100]
+_TRANSCRIPT_DISPLAY_STATS_PCT_KEYS = [0.1, 1, 5, 25, 50, 95, 99, 100]
 
 # Genes with fewer than this many total counts skip the full percentile
 # computation -- checked 2026-08-26 against a real 549K-spot / 19K-gene whole-
@@ -146,12 +146,12 @@ _TRANSCRIPT_ALPHA_PCT_KEYS = [0.1, 1, 5, 25, 50, 95, 99, 100]
 # handful of genuinely high cells or noise scattered everywhere; neither case
 # is usefully described by a table of percentiles. Cheap to tune
 # later -- doesn't force a version bump, see genes_reduced below.
-_TRANSCRIPT_ALPHA_MIN_SUM = 250
+_TRANSCRIPT_DISPLAY_STATS_MIN_SUM = 250
 
 
 def _percentile_row(values: np.ndarray) -> list:
     """
-    Shared tail of the transcript_alpha per-gene stat row: 8 percentiles computed
+    Shared tail of the transcript_display_stats per-gene stat row: 8 percentiles computed
     over nonzero values only, + rank of the first nonzero entry in the full
     ascending-sorted array (zeros included -- a cheap zero-fraction proxy), + sum
     of all values (not derivable from the percentiles, and the most commonly
@@ -161,11 +161,11 @@ def _percentile_row(values: np.ndarray) -> list:
     first_nonzero_rank = int(np.searchsorted(values, 1))
     nonzero = values[first_nonzero_rank:]
     pct_source = nonzero if len(nonzero) > 0 else values
-    percentiles = np.percentile(pct_source, _TRANSCRIPT_ALPHA_PCT_KEYS).tolist()
+    percentiles = np.percentile(pct_source, _TRANSCRIPT_DISPLAY_STATS_PCT_KEYS).tolist()
     return percentiles + [first_nonzero_rank, float(values.sum())]
 
 
-def build_transcript_alpha_table(adata, platform: str, bin_um: Optional[float] = None,
+def build_transcript_display_stats_table(adata, platform: str, bin_um: Optional[float] = None,
                                   gene_col: str = 'feature'):
     """
     Precompute a small per-gene percentile table for fast display/contrast
@@ -198,7 +198,7 @@ def build_transcript_alpha_table(adata, platform: str, bin_um: Optional[float] =
         the sparse groupby result is sufficient and stays O(N) regardless of
         how many bins bin_um produces.
 
-    Genes with fewer than _TRANSCRIPT_ALPHA_MIN_SUM total counts skip the full
+    Genes with fewer than _TRANSCRIPT_DISPLAY_STATS_MIN_SUM total counts skip the full
     percentile computation entirely and get a cheap [max, sum] pair in
     'genes_reduced' instead -- below that floor, a gene's signal is either a
     handful of genuinely high cells or scattered noise, and neither case is
@@ -208,11 +208,11 @@ def build_transcript_alpha_table(adata, platform: str, bin_um: Optional[float] =
     sum first avoids that cost for the ~30%+ of genes typically below floor in
     real whole-transcriptome data.
 
-    Returns a dict ready to be JSON-stringified into adata.uns['transcript_alpha']:
+    Returns a dict ready to be JSON-stringified into adata.uns['transcript_display_stats']:
         {'bin_um': <the spatial bin size, in microns, the stats were computed
                     over -- histogram tile size for xenium, source spot-bin
                     level for visium (set by the caller for visium; None here)>,
-         'min_sum_threshold': _TRANSCRIPT_ALPHA_MIN_SUM,
+         'min_sum_threshold': _TRANSCRIPT_DISPLAY_STATS_MIN_SUM,
          'genes': {gene: [p0.1, p1, p5, p25, p50, p95, p99, p100,
                            first_nonzero_rank, sum], ...},
          'genes_reduced': {gene: [max, sum], ...}}
@@ -222,7 +222,7 @@ def build_transcript_alpha_table(adata, platform: str, bin_um: Optional[float] =
         if gene_col not in adata.obs.columns or 'spatial' not in adata.obsm:
             return None
         if bin_um is None:
-            raise ValueError("bin_um is required to build transcript_alpha for a xenium channel")
+            raise ValueError("bin_um is required to build transcript_display_stats for a xenium channel")
 
         coords = adata.obsm['spatial']
         genes_arr = np.asarray(adata.obs[gene_col].values)
@@ -254,15 +254,15 @@ def build_transcript_alpha_table(adata, platform: str, bin_um: Optional[float] =
             total = int(gene_totals[gene_code])
             nonzero_vals = per_gene.to_numpy()  # this gene's nonzero per-bin counts only
 
-            if total < _TRANSCRIPT_ALPHA_MIN_SUM:
+            if total < _TRANSCRIPT_DISPLAY_STATS_MIN_SUM:
                 genes_reduced[str(gene)] = [float(nonzero_vals.max()), float(total)]
             else:
                 nonzero_sorted = np.sort(nonzero_vals)
                 first_nonzero_rank = n_bins - len(nonzero_sorted)  # = count of zero bins
-                percentiles = np.percentile(nonzero_sorted, _TRANSCRIPT_ALPHA_PCT_KEYS).tolist()
+                percentiles = np.percentile(nonzero_sorted, _TRANSCRIPT_DISPLAY_STATS_PCT_KEYS).tolist()
                 gene_table[str(gene)] = percentiles + [int(first_nonzero_rank), float(total)]
 
-        return {'bin_um': float(bin_um), 'min_sum_threshold': _TRANSCRIPT_ALPHA_MIN_SUM,
+        return {'bin_um': float(bin_um), 'min_sum_threshold': _TRANSCRIPT_DISPLAY_STATS_MIN_SUM,
                 'genes': gene_table, 'genes_reduced': genes_reduced}
 
     else:  # visium (and other binned platforms with a genuine spot x gene matrix)
@@ -279,7 +279,7 @@ def build_transcript_alpha_table(adata, platform: str, bin_um: Optional[float] =
         gene_table, genes_reduced = {}, {}
         for i, gene in enumerate(adata.var_names):
             col = X[:, i]
-            if gene_sums[i] < _TRANSCRIPT_ALPHA_MIN_SUM:
+            if gene_sums[i] < _TRANSCRIPT_DISPLAY_STATS_MIN_SUM:
                 # Skip densifying the full column for low-signal genes -- just
                 # need the max, which sparse .data (nonzero entries only) gives
                 # directly without materializing all n_spots values.
@@ -296,7 +296,7 @@ def build_transcript_alpha_table(adata, platform: str, bin_um: Optional[float] =
                 col = col.toarray().ravel() if sp.issparse(col) else np.asarray(col).ravel()
                 gene_table[str(gene)] = _percentile_row(col)
 
-        return {'bin_um': None, 'min_sum_threshold': _TRANSCRIPT_ALPHA_MIN_SUM,
+        return {'bin_um': None, 'min_sum_threshold': _TRANSCRIPT_DISPLAY_STATS_MIN_SUM,
                 'genes': gene_table, 'genes_reduced': genes_reduced}
 
 
@@ -352,9 +352,9 @@ def _sanitize_for_zarr(obj: Any) -> Any:
 ## including metadta and ROIs.
 ################################
 
-def _derive_transcript_alpha_bin_um(sample: SampleSet, omic_chan: OmicChannel) -> float:
+def _derive_transcript_display_stats_bin_um(sample: SampleSet, omic_chan: OmicChannel) -> float:
     """
-    Picks a spatial bin size for transcript_alpha's Xenium pseudo-render
+    Picks a spatial bin size for transcript_display_stats's Xenium pseudo-render
     histogram: the second-coarsest level of an image channel's pyramid in the
     same sample (any one -- they're registered to the same coordinate system,
     so which specific channel doesn't matter). Deliberately not the coarsest
@@ -503,9 +503,9 @@ def save_sample(
             spatial_list = np.array(omic_chan.spatial_meta.transform_matrix).tolist()
             channel_meta = _sanitize_for_zarr(omic_chan.metadata)
             platform = omic_chan.metadata.get('platform', 'visium')
-            alpha_bin_um = _derive_transcript_alpha_bin_um(sample, omic_chan) if platform == 'xenium' else None
+            stats_bin_um = _derive_transcript_display_stats_bin_um(sample, omic_chan) if platform == 'xenium' else None
 
-            # Compute transcript_alpha ONCE from a single reference level, not once per
+            # Compute transcript_display_stats ONCE from a single reference level, not once per
             # pyramid level -- otherwise each resolution's table would be individually
             # noisy (Visium's 4um bins in particular). Mirrors the image side's own
             # choice to compute display_stats from one smooth thumbnail regardless of
@@ -513,7 +513,7 @@ def save_sample(
             # "not the single coarsest option" principle as the Xenium bin_um choice
             # above -- coarsest available today is 16um, so this lands on 8um).
             # For Xenium there's only ever one pyramid entry (the 0.0 flag) anyway.
-            alpha_table = None
+            stats_table = None
             if omic_chan.pyramid:
                 levels_sorted = sorted(omic_chan.pyramid.keys())
                 ref_level = levels_sorted[0] if platform == 'xenium' else (
@@ -522,9 +522,9 @@ def save_sample(
                 ref_adata = omic_chan.pyramid[ref_level]
                 if isinstance(ref_adata, pd.DataFrame):
                     ref_adata = ad.AnnData(obs=ref_adata)
-                alpha_table = build_transcript_alpha_table(ref_adata, platform, bin_um=alpha_bin_um)
-                if platform != 'xenium' and alpha_table is not None:
-                    alpha_table['bin_um'] = float(ref_level)  # which spot-bin level was used
+                stats_table = build_transcript_display_stats_table(ref_adata, platform, bin_um=stats_bin_um)
+                if platform != 'xenium' and stats_table is not None:
+                    stats_table['bin_um'] = float(ref_level)  # which spot-bin level was used
 
             for bin_um, adata_level in omic_chan.pyramid.items():
                 if isinstance(adata_level, pd.DataFrame):
@@ -532,9 +532,9 @@ def save_sample(
                 adata_level.uns['spatial_meta'] = spatial_list
                 adata_level.uns['channel_meta'] = channel_meta
 
-                if alpha_table is not None:
-                    adata_level.uns['transcript_alpha'] = json.dumps(alpha_table)
-                    adata_level.uns['opt_transcript_alpha_version'] = OPT_TRANSCRIPT_ALPHA_VERSION
+                if stats_table is not None:
+                    adata_level.uns['transcript_display_stats'] = json.dumps(stats_table)
+                    adata_level.uns['opt_transcript_display_stats_version'] = OPT_TRANSCRIPT_DISPLAY_STATS_VERSION
 
                 dest_path = chan_dir / f"{float(bin_um):.1f}um.zarr"
                 adata_level.write_zarr(dest_path)
