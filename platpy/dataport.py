@@ -229,7 +229,6 @@ class DataPort:
         transcripts near block edges (whose parent cell may straddle the boundary)
         are not missed.  50 µm ≈ 2-3 cell diameters — conservative but cheap.
         """
-        import json
         import numpy as np
 
         min_x, max_x, min_y, max_y = self.roi_extent
@@ -237,20 +236,14 @@ class DataPort:
 
         # --- Block index fast path ---
         if 'block_index' in adata.uns:
-            index_data = json.loads(adata.uns['block_index'])
-            blocks = index_data['blocks']
+            from .io_utils import query_block_index
 
             q_min_x = min_x - buffer_um
             q_max_x = max_x + buffer_um
             q_min_y = min_y - buffer_um
             q_max_y = max_y + buffer_um
 
-            hit_ranges = [
-                (b['row_start'], b['row_end'])
-                for b in blocks
-                if b['max_x'] >= q_min_x and b['min_x'] <= q_max_x
-                and b['max_y'] >= q_min_y and b['min_y'] <= q_max_y
-            ]
+            hit_ranges = query_block_index(adata.uns['block_index'], q_min_x, q_max_x, q_min_y, q_max_y)
 
             if not hit_ranges:
                 empty = adata[np.array([], dtype=int)].copy()

@@ -131,6 +131,28 @@ def build_spatial_block_index(adata, mpp, chunk_px=1024, gene_col=None):
     return adata_sorted
 
 
+def query_block_index(block_index_json: str, min_x: float, max_x: float,
+                       min_y: float, max_y: float):
+    """
+    Given a JSON-encoded block_index (see build_spatial_block_index above) and
+    a query bounding box, return the list of (row_start, row_end) ranges for
+    every block whose own bounds overlap the box.
+
+    Shared by DataPort's extraction path (dataport.py) and ViewPort's Xenium
+    render path (render_utils.py) so both narrow to the same row ranges
+    before doing their own precise per-row filter -- one implementation of
+    "which blocks does this query touch", not two copies that can drift
+    apart from each other.
+    """
+    blocks = json.loads(block_index_json)['blocks']
+    return [
+        (b['row_start'], b['row_end'])
+        for b in blocks
+        if b['max_x'] >= min_x and b['min_x'] <= max_x
+        and b['max_y'] >= min_y and b['min_y'] <= max_y
+    ]
+
+
 # Percentile ticks for the transcript_display_stats table. Coarser than the image side's
 # 16-point display_stats (which is one array total per image) since this multiplies
 # per-gene and panels can run to thousands of genes. Zeros are dropped before
