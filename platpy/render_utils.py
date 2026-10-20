@@ -161,26 +161,32 @@ def _render_xenium_to_array(data, extent, shape, gene_name=None, bin_um=None) ->
     per bin, giving brighter signal for sparse genes. The coarsened histogram is
     bilinearly upsampled back to shape before returning.
     """
-    df = data.obs if hasattr(data, 'obs') else data
+    from .lazy_transcripts import LazyTranscripts
+
     left, right, bottom, top = extent
     h, w = shape[:2]
-    gene_col = 'feature' if 'feature' in df.columns else 'feature_name'
+    q_min_y, q_max_y = min(bottom, top), max(bottom, top)
+    gene_col = 'feature'
 
-    # Block index fast path -- a render is almost always a small viewport out of
-    # a multi-million-row section, so narrow to the blocks that actually overlap
-    # this extent before doing anything else (gene filter, histogram2d). Falls
-    # back to the previous full-scan behavior if no index is present (e.g. a
-    # bundle saved before build_spatial_block_index existed).
-    block_index = getattr(data, 'uns', {}).get('block_index') if hasattr(data, 'uns') else None
-    if block_index:
-        from .io_utils import query_block_index
-        q_min_y, q_max_y = min(bottom, top), max(bottom, top)
-        hit_ranges = query_block_index(block_index, left, right, q_min_y, q_max_y)
-        if not hit_ranges:
-            df = df.iloc[0:0]
-        else:
-            row_idx = np.concatenate([np.arange(r0, r1) for r0, r1 in hit_ranges])
-            df = df.iloc[row_idx]
+    if isinstance(data, LazyTranscripts):
+        # A render is almost always a small viewport out of a multi-million-row
+        # section -- resolve to the overlapping blocks and materialize only
+        # those rows, rather than ever touching the rest of the point cloud.
+        hit_ranges = data.row_ranges_for_block_index(left, right, q_min_y, q_max_y)
+        df = data.materialize(hit_ranges)
+    else:
+        # Non-lazy fallback (in-memory-constructed data, older bundles, etc.)
+        df = data.obs if hasattr(data, 'obs') else data
+        gene_col = 'feature' if 'feature' in df.columns else 'feature_name'
+        block_index = getattr(data, 'uns', {}).get('block_index') if hasattr(data, 'uns') else None
+        if block_index:
+            from .io_utils import query_block_index
+            hit_ranges = query_block_index(block_index, left, right, q_min_y, q_max_y)
+            if not hit_ranges:
+                df = df.iloc[0:0]
+            else:
+                row_idx = np.concatenate([np.arange(r0, r1) for r0, r1 in hit_ranges])
+                df = df.iloc[row_idx]
 
     subset = df if gene_name is None else df[df[gene_col] == gene_name]
 
