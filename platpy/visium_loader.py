@@ -189,6 +189,13 @@ def load_visium_directory(
                 "platform": "visium",
                 "geometry_type": omic_geometry,
                 "bin_size_um": finest_bin_um,
+                # Matches Xenium's total_transcripts semantics (row count at
+                # ingestion, same value extract_roi()'s _cropped_omic_metadata()
+                # recomputes after a crop) -- the finest loaded bin's spot
+                # count, not a literal transcript count, since Visium rows are
+                # already-aggregated bins rather than individual detections.
+                "total_transcripts": int(omic_pyramid[finest_bin_um].n_obs),
+                "source": os.path.basename(os.path.normpath(base_dir)),
             },
             pyramid=omic_pyramid
         )

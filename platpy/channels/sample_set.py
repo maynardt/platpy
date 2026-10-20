@@ -178,12 +178,29 @@ class SampleSet:
                     (coords[:, 1] >= min_y_um) & (coords[:, 1] <= max_y_um)
                 )
                 cropped_data = omic.data[mask].copy()
+
+                # Each pyramid level has its own (different) spot/row count --
+                # a coarser bin means fewer spots over the same area -- so the
+                # crop mask has to be computed per-level against that level's
+                # own coordinates. Reusing omic.data's mask (sized for
+                # whichever single level .data happens to point to) across
+                # every other level crashes with a shape mismatch the moment
+                # more than one bin level is loaded, which is the normal case.
+                cropped_pyramid = {}
+                for bin_um, level_data in omic.pyramid.items():
+                    level_coords = level_data.obsm['spatial']
+                    level_mask = (
+                        (level_coords[:, 0] >= min_x_um) & (level_coords[:, 0] <= max_x_um) &
+                        (level_coords[:, 1] >= min_y_um) & (level_coords[:, 1] <= max_y_um)
+                    )
+                    cropped_pyramid[bin_um] = level_data[level_mask].copy()
+
                 out.omics[om_name] = OmicChannel(
                     name=om_name,
                     data=cropped_data,
                     spatial_meta=omic.spatial_meta,
                     metadata=_cropped_omic_metadata(omic.metadata, cropped_data.n_obs),
-                    pyramid={k: v[mask] for k, v in omic.pyramid.items()}
+                    pyramid=cropped_pyramid
                 )
 
         margin_min_x, margin_max_x = min_x_um - cell_margin_um, max_x_um + cell_margin_um
