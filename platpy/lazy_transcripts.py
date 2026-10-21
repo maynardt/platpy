@@ -21,7 +21,7 @@ table first (via .materialize()) before anything downstream touches it, so
 there's nothing to lose by not preserving AnnData's shape here.
 """
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Sequence, Tuple
+from typing import Any, Dict, Optional, Sequence, Tuple
 
 import json
 import numpy as np
@@ -84,6 +84,25 @@ class LazyTranscripts:
     feature: LazyCategorical
     cell_id: LazyCategorical
     uns: Dict = field(default_factory=dict)
+    _cached_obs: Any = field(default=None, repr=False, init=False)
+
+    @property
+    def obs(self) -> pd.DataFrame:
+        """
+        Full materialize, cached after the first access -- a compatibility
+        shim for code written against the old eager AnnData.obs pattern
+        (sample.omics['transcripts'].data.obs, used throughout the vignettes
+        and real analysis notebooks before this session's lazy-loading work).
+
+        This deliberately defeats partial-read laziness -- it needs every
+        row, by definition, same as calling .materialize() with no row_ranges
+        would. Anything performance-sensitive should use
+        row_ranges_for_block_index() + materialize(ranges) directly instead,
+        the same way DataPort/ViewPort/build_cells_xenium() already do.
+        """
+        if self._cached_obs is None:
+            self._cached_obs = self.materialize()
+        return self._cached_obs
 
     def row_ranges_for_block_index(self, min_x: float, max_x: float,
                                     min_y: float, max_y: float) -> list:
