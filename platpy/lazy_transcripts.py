@@ -29,6 +29,18 @@ import pandas as pd
 import dask.array as da
 import zarr
 
+# Once a materialize() row-range selection covers at least this percentage of
+# a transcript table's rows, switch from a scattered dask fancy-index gather
+# to a plain contiguous slice + in-memory boolean mask. Measured (2026-10-21,
+# PRIME_273_WT_02, 46.67M-row Xenium Prime 5K section) crossover where the
+# gather path stops being faster than just reading everything: ~6-20% of rows
+# on local disk, ~21-44% over NFS -- the gather's per-index gather overhead
+# gets *worse*, not better, as the selection approaches "nearly everything",
+# since that's exactly when a slice would be nearly free. 25 sits comfortably
+# under the NFS crossover and only a bit above local's, erring toward keeping
+# the (cheap) fast path available on NFS. Pass opt_cutoff=100 to disable.
+OPT_BULK_READ_CUTOFF_PCT = 25
+
 
 @dataclass
 class LazyCategorical:
@@ -115,37 +127,57 @@ class LazyTranscripts:
         from .io_utils import query_block_index
         return query_block_index(block_index, min_x, max_x, min_y, max_y)
 
-    def materialize(self, row_ranges: Optional[Sequence[Tuple[int, int]]] = None) -> pd.DataFrame:
+    def materialize(self, row_ranges: Optional[Sequence[Tuple[int, int]]] = None,
+                     opt_cutoff: float = OPT_BULK_READ_CUTOFF_PCT) -> pd.DataFrame:
         """
         Pull the given row ranges (or everything, if row_ranges is None) into
         a real, small, in-memory DataFrame -- columns: transcript_id, cell_id,
         feature, x, y, qv. This is the one place actual data gets read and
         computed; everything before this call stays lazy.
+
+        opt_cutoff: once row_ranges covers at least this percentage of
+        n_obs, read everything via one contiguous slice and boolean-mask down
+        to the requested ranges in memory, instead of a scattered dask
+        fancy-index gather over row_ranges -- see OPT_BULK_READ_CUTOFF_PCT's
+        comment for the measured crossover this default is based on. Pass
+        100 (or anything >=100) to always use the gather path.
         """
         if row_ranges is None:
-            row_idx = np.arange(self.n_obs)
-        elif not row_ranges:
-            row_idx = np.array([], dtype=np.int64)
-        else:
-            row_idx = np.concatenate([np.arange(r0, r1) for r0, r1 in row_ranges])
+            return self._materialize_idx(slice(None))
+        if not row_ranges:
+            return self._empty_frame()
 
-        if len(row_idx) == 0:
-            return pd.DataFrame({
-                'transcript_id': pd.array([], dtype='uint64'),
-                'cell_id': pd.array([], dtype='object'),
-                'feature': pd.array([], dtype='object'),
-                'x': pd.array([], dtype='float32'),
-                'y': pd.array([], dtype='float32'),
-                'qv': pd.array([], dtype='float32'),
-            })
+        total_selected = sum(r1 - r0 for r0, r1 in row_ranges)
+        frac_pct = 100.0 * total_selected / self.n_obs if self.n_obs else 0.0
 
+        if frac_pct >= opt_cutoff:
+            mask = np.zeros(self.n_obs, dtype=bool)
+            for r0, r1 in row_ranges:
+                mask[r0:r1] = True
+            df = self._materialize_idx(slice(None))
+            return df[mask].reset_index(drop=True)
+
+        row_idx = np.concatenate([np.arange(r0, r1) for r0, r1 in row_ranges])
+        return self._materialize_idx(row_idx)
+
+    def _empty_frame(self) -> pd.DataFrame:
         return pd.DataFrame({
-            'transcript_id': np.asarray(self.transcript_id[row_idx].compute()),
-            'cell_id':       self.cell_id.materialize(row_idx),
-            'feature':       self.feature.materialize(row_idx),
-            'x':             np.asarray(self.x[row_idx].compute()),
-            'y':             np.asarray(self.y[row_idx].compute()),
-            'qv':            np.asarray(self.qv[row_idx].compute()),
+            'transcript_id': pd.array([], dtype='uint64'),
+            'cell_id': pd.array([], dtype='object'),
+            'feature': pd.array([], dtype='object'),
+            'x': pd.array([], dtype='float32'),
+            'y': pd.array([], dtype='float32'),
+            'qv': pd.array([], dtype='float32'),
+        })
+
+    def _materialize_idx(self, idx) -> pd.DataFrame:
+        return pd.DataFrame({
+            'transcript_id': np.asarray(self.transcript_id[idx].compute()),
+            'cell_id':       self.cell_id.materialize(idx),
+            'feature':       self.feature.materialize(idx),
+            'x':             np.asarray(self.x[idx].compute()),
+            'y':             np.asarray(self.y[idx].compute()),
+            'qv':            np.asarray(self.qv[idx].compute()),
         })
 
 
