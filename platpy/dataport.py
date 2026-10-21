@@ -219,7 +219,7 @@ class DataPort:
 
     def _extract_omic_xenium(self, channel: OmicChannel, gene: Optional[str] = None,
                              buffer_um: float = 50.0):
-        """AnnData extraction for transcript point-cloud platforms (Xenium, etc.).
+        """DataFrame extraction for transcript point-cloud platforms (Xenium, etc.).
 
         channel.data is a lazy_transcripts.LazyTranscripts -- resolves the
         query bbox to block_index row ranges (falls back to a full scan if no
@@ -234,10 +234,16 @@ class DataPort:
         lazy path yet -- always uses raw x/y. Mainly matters for Visium's
         spot-grid-to-image registration; low-impact for Xenium's own
         instrument-native coordinates, but a real gap if that changes.
-        """
-        import anndata as ad
-        import numpy as np
 
+        Returns a plain DataFrame, not AnnData -- there's no X matrix here
+        (point-cloud transcripts, not a cell x gene table), so wrapping in
+        AnnData was pure overhead with no payoff: profiled at 21s to build
+        vs. 14s for the actual data read on a 46.67M-row whole-section query
+        (2026-10-21, see project_platpy_whole_section_query_perf memory).
+        Matches this method's own long-standing docstring contract
+        ("DataFrame subset for 'xenium'" on extract_omic() above), which the
+        AnnData wrap had drifted from.
+        """
         min_x, max_x, min_y, max_y = self.roi_extent
         lazy = channel.data
 
@@ -255,11 +261,9 @@ class DataPort:
             df = df[df['feature'] == gene]
 
         df = df.reset_index(drop=True)
-        df.index = df.index.astype(str)
-        subset = ad.AnnData(obs=df)
-        subset.obs['x_micron'] = df['x'].to_numpy()
-        subset.obs['y_micron'] = df['y'].to_numpy()
-        return subset
+        df['x_micron'] = df['x']
+        df['y_micron'] = df['y']
+        return df
 
     # =========================================================================
     # TILING
