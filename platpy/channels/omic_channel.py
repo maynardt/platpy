@@ -68,7 +68,22 @@ class OmicChannel(BaseChannel):
         Falls back to the raw baseline ('spatial' / 'x'+'y') if no fine coords exist.
         """
         import numpy as np
+        from ..lazy_transcripts import LazyTranscripts
         use = self.use_fine_alignment
+
+        if isinstance(self.data, LazyTranscripts):
+            # Lazy point cloud -- there's no fine-alignment correction stored
+            # on this path yet (see apply_fine_alignment()'s own TODO for
+            # when that's wired up here too); materializing just x/y for the
+            # whole channel defeats the point of it being lazy, so callers
+            # needing coordinates for a query should resolve row ranges via
+            # row_ranges_for_block_index()/materialize() directly instead of
+            # going through this all-at-once accessor.
+            raise NotImplementedError(
+                "get_active_coords() needs the full point cloud materialized, which "
+                "defeats lazy loading -- use row_ranges_for_block_index() + materialize() "
+                "on the LazyTranscripts object directly instead."
+            )
 
         if hasattr(self.data, 'obsm'):
             # AnnData path (Visium / binned Xenium)

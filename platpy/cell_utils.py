@@ -39,10 +39,11 @@ def _encode_coord(val_um, precision=10):
 # builds (adata.uns['build_cells_xenium_version']) so a save-time cache from
 # an older platpy is never silently trusted as if it were current -- see
 # save_sample()'s build_default_cells handling in io_utils.py.
-BUILD_CELLS_XENIUM_VERSION = 1
+BUILD_CELLS_XENIUM_VERSION = 2
 
 
-def build_cells_xenium(sample, force_recompute: bool = False, verbose: bool = True):
+def build_cells_xenium(sample, roi=None, discard_straddlers: bool = True,
+                        force_recompute: bool = False, verbose: bool = True):
     """
     Build a cells x genes AnnData from Xenium transcript data.
 
@@ -70,6 +71,34 @@ def build_cells_xenium(sample, force_recompute: bool = False, verbose: bool = Tr
     sample : SampleSet
         Loaded Xenium sample.  Must have sample.omics['transcripts'] with obs
         columns: cell_id, feature, x, y.
+    roi : (min_x_um, max_x_um, min_y_um, max_y_um) or None
+        Restrict to transcripts in this bbox -- for a lazily-loaded sample
+        (see lazy_transcripts.py), only the overlapping spatial blocks are
+        ever materialized, not the whole section. No margin/buffer around
+        the box (unlike extract_roi()'s cell_margin_um): a cell whose body
+        straddles the boundary only gets counted for the transcripts that
+        landed inside the box, so its gene counts come out undercounted
+        relative to a full-bundle build -- its centroid/area (from the real
+        instrument polygon, unaffected by this) can also end up just outside
+        the box for the same reason. Fine for "give me approximate cells in
+        this region" use; not a substitute for extract_roi() + a full build
+        when exact per-cell counts at the edges matter. Disables the
+        save-time cache (which covers the whole bundle, not a sub-region) --
+        force_recompute is implied whenever roi is given.
+    discard_straddlers : bool
+        Only meaningful when roi is given. True (default): drop any cell
+        whose boundary polygon isn't *entirely* inside the roi -- its full
+        vertex set, not just its centroid (a cell can have an in-bounds
+        centroid while still having vertices, and therefore transcripts,
+        outside the box). The alternative to dropping it is keeping it with
+        an undercounted expression profile, which is worse for most
+        analysis uses than just not having the cell. False keeps every cell
+        with any transcript in the roi, undercounted edges and all -- only
+        useful if you specifically want that tradeoff. Requires
+        sample.cells['cell_boundaries'].boundaries (the real per-vertex
+        polygon table); falls back to keeping straddlers (with a printed
+        notice when verbose) if that channel isn't present, since there's
+        nothing to test against.
     force_recompute : bool
         Skip the save-time cache (if any) and recompute from the raw
         transcripts every time.
@@ -84,24 +113,89 @@ def build_cells_xenium(sample, force_recompute: bool = False, verbose: bool = Tr
               n_transcripts, n_genes
         obsm['spatial'] : (n_cells, 2) centroid coordinates in microns
     """
+    from .lazy_value import resolve as _resolve_lazy
+
     boundary_chan = sample.cells.get('cell_boundaries')
-    if not force_recompute and boundary_chan is not None and boundary_chan.data is not None:
-        cached_version = boundary_chan.data.uns.get('build_cells_xenium_version')
+    # Only resolve the cached .data if it's actually going to be used -- a
+    # plain `boundary_chan.data is not None` check would already force the
+    # resolve as a side effect of the attribute access itself (CellChannel's
+    # __getattribute__ resolves transparently on *any* read), which would
+    # defeat the point of it being deferred for exactly the roi=/
+    # force_recompute=True calls that were never going to touch it. Peek the
+    # raw stored value via object.__getattribute__ (bypassing that
+    # transparency on purpose, just for this existence check) instead --
+    # True for either an unresolved Deferred or an already-resolved AnnData,
+    # same as `is not None` would have meant, just without forcing the read.
+    has_cached_data = (boundary_chan is not None
+                        and object.__getattribute__(boundary_chan, 'data') is not None)
+    if roi is None and not force_recompute and has_cached_data:
+        cached_data = boundary_chan.data  # intentional resolve -- we're using it now
+        cached_version = cached_data.uns.get('build_cells_xenium_version')
         if cached_version == BUILD_CELLS_XENIUM_VERSION:
             if verbose:
                 print(f"Using cell x gene matrix cached at save time "
-                      f"({boundary_chan.data.n_obs:,} cells x {boundary_chan.data.n_vars:,} genes).")
-            return boundary_chan.data
+                      f"({cached_data.n_obs:,} cells x {cached_data.n_vars:,} genes).")
+            return cached_data
         elif verbose:
             print(f"Cached cell x gene matrix is from an older platpy "
                   f"(version {cached_version}, current {BUILD_CELLS_XENIUM_VERSION}) -- recomputing.")
 
     # Pull only the columns we need to keep memory footprint small
-    tx = sample.omics['transcripts'].data.obs[['cell_id', 'feature', 'x', 'y']].copy()
+    from .lazy_transcripts import LazyTranscripts
+    tx_data = sample.omics['transcripts'].data
+
+    if isinstance(tx_data, LazyTranscripts):
+        if roi is not None:
+            min_x, max_x, min_y, max_y = roi
+            hit_ranges = tx_data.row_ranges_for_block_index(min_x, max_x, min_y, max_y)
+            tx = tx_data.materialize(hit_ranges)
+            tx = tx[(tx['x'] >= min_x) & (tx['x'] <= max_x) &
+                    (tx['y'] >= min_y) & (tx['y'] <= max_y)]
+        else:
+            tx = tx_data.materialize()
+        tx = tx[['cell_id', 'feature', 'x', 'y']].copy()
+    else:
+        # Non-lazy fallback (in-memory-constructed data, older bundles, etc.)
+        tx = tx_data.obs[['cell_id', 'feature', 'x', 'y']].copy()
+        if roi is not None:
+            min_x, max_x, min_y, max_y = roi
+            tx = tx[(tx['x'] >= min_x) & (tx['x'] <= max_x) &
+                    (tx['y'] >= min_y) & (tx['y'] <= max_y)]
 
     # Drop unassigned transcripts — Xenium uses 0 (int) or 'UNASSIGNED' (str)
     tx = tx[~tx['cell_id'].astype(str).isin(['0', '-1', 'UNASSIGNED'])]
     tx['cell_id'] = tx['cell_id'].astype(str)
+
+    if roi is not None and discard_straddlers:
+        boundary_chan = sample.cells.get('cell_boundaries')
+        if boundary_chan is None or boundary_chan.boundaries is None:
+            if verbose:
+                print("discard_straddlers=True requested but no cell_boundaries "
+                      "channel is present -- keeping straddler cells (undercounted).")
+        else:
+            min_x, max_x, min_y, max_y = roi
+            b = _resolve_lazy(boundary_chan.boundaries)
+            b_obs = b.obs if hasattr(b, 'obs') else b
+            # A cell's full polygon is inside the roi only if EVERY vertex is --
+            # a vectorized per-cell min/max is equivalent to that (and far
+            # cheaper than a groupby().apply() over every vertex) since "all
+            # vertices within [min_x,max_x]x[min_y,max_y]" <=> "the vertex
+            # bounding box is within it".
+            vbounds = b_obs.groupby('cell_id', observed=True).agg(
+                vx_min=('x', 'min'), vx_max=('x', 'max'),
+                vy_min=('y', 'min'), vy_max=('y', 'max'),
+            )
+            whole = vbounds[
+                (vbounds['vx_min'] >= min_x) & (vbounds['vx_max'] <= max_x) &
+                (vbounds['vy_min'] >= min_y) & (vbounds['vy_max'] <= max_y)
+            ]
+            keep_ids = set(whole.index.astype(str))
+            n_before = tx['cell_id'].nunique()
+            tx = tx[tx['cell_id'].isin(keep_ids)]
+            if verbose:
+                n_after = tx['cell_id'].nunique()
+                print(f"Discarded {n_before - n_after:,} straddler cell(s) "
+                      f"(boundary polygon not entirely inside roi) of {n_before:,}.")
 
     # Drop Xenium internal codewords (not real genes)
     codeword_mask = tx['feature'].str.contains(
@@ -127,8 +221,13 @@ def build_cells_xenium(sample, force_recompute: bool = False, verbose: bool = Tr
     cell_idx = {c: i for i, c in enumerate(cells)}
     gene_idx = {g: i for i, g in enumerate(genes)}
 
-    rows = tx['cell_id'].map(cell_idx).values
-    cols = tx['feature'].map(gene_idx).values
+    # int32 rather than pandas' default int64 for these -- cell/gene counts
+    # are nowhere near int32's ~2.1 billion ceiling for any realistic single
+    # section, and indices/indptr dominate a sparse matrix's memory footprint
+    # (bigger than the actual float32 data for a typical count matrix), so
+    # this roughly halves the matrix's size for free.
+    rows = tx['cell_id'].map(cell_idx).values.astype(np.int32)
+    cols = tx['feature'].map(gene_idx).values.astype(np.int32)
 
     # One transcript = one count; sparse to keep memory low
     X = sp.csr_matrix(

@@ -9,7 +9,7 @@ import pandas as pd
 import dask.array as da
 import zarr
 import anndata as ad
-from typing import Optional, Any, Dict
+from typing import Optional, Any, Dict, Tuple
 
 
 # platpy imports
@@ -31,8 +31,7 @@ ad.settings.zarr_write_format = 3
 # the presence-checks already use -- not a breaking change for older files.
 PLATPY_FORMAT_VERSION = 1
 OPT_BLOCK_INDEX_VERSION = 1
-OPT_NAME_OFFSET_VERSION = 1
-OPT_TRANSCRIPT_ALPHA_VERSION = 1
+OPT_TRANSCRIPT_DISPLAY_STATS_VERSION = 1
 
 
 def build_spatial_block_index(adata, mpp, chunk_px=1024, gene_col=None):
@@ -96,22 +95,6 @@ def build_spatial_block_index(adata, mpp, chunk_px=1024, gene_col=None):
         for k in range(len(starts))
     ]
 
-    # Add coarse gene name-prefix index within each block (Xenium only — gene_col must be set).
-    # Genes are already sorted alphabetically within each block, so searchsorted finds boundaries
-    # in O(log n) at query time with zero extra storage overhead beyond these small per-block dicts.
-    if gene_col is not None:
-        gene_vals = adata_sorted.obs[gene_col].values
-        for b in blocks:
-            genes = gene_vals[b['row_start']:b['row_end']]
-            letters = sorted(set(g[0].upper() for g in genes if g))
-            b['name_offsets'] = {
-                letter: (
-                    int(np.searchsorted(genes, letter)),
-                    int(np.searchsorted(genes, chr(ord(letter) + 1), 'left'))
-                )
-                for letter in letters
-            }
-
     # Store as a JSON string — AnnData's zarr backend converts list-of-dicts
     # entries in uns to str() representations (single quotes, not JSON-compatible).
     # A single string value round-trips correctly through zarr.
@@ -126,18 +109,38 @@ def build_spatial_block_index(adata, mpp, chunk_px=1024, gene_col=None):
     # though both features are built right here, so each can be bumped/tested on its
     # own without disturbing the other.
     adata_sorted.uns['opt_block_index_version'] = OPT_BLOCK_INDEX_VERSION
-    if gene_col is not None:
-        adata_sorted.uns['opt_name_offset_version'] = OPT_NAME_OFFSET_VERSION
     return adata_sorted
 
 
-# Percentile ticks for the transcript_alpha table. Coarser than the image side's
+def query_block_index(block_index_json: str, min_x: float, max_x: float,
+                       min_y: float, max_y: float):
+    """
+    Given a JSON-encoded block_index (see build_spatial_block_index above) and
+    a query bounding box, return the list of (row_start, row_end) ranges for
+    every block whose own bounds overlap the box.
+
+    Shared by DataPort's extraction path (dataport.py) and ViewPort's Xenium
+    render path (render_utils.py) so both narrow to the same row ranges
+    before doing their own precise per-row filter -- one implementation of
+    "which blocks does this query touch", not two copies that can drift
+    apart from each other.
+    """
+    blocks = json.loads(block_index_json)['blocks']
+    return [
+        (b['row_start'], b['row_end'])
+        for b in blocks
+        if b['max_x'] >= min_x and b['min_x'] <= max_x
+        and b['max_y'] >= min_y and b['min_y'] <= max_y
+    ]
+
+
+# Percentile ticks for the transcript_display_stats table. Coarser than the image side's
 # 16-point display_stats (which is one array total per image) since this multiplies
 # per-gene and panels can run to thousands of genes. Zeros are dropped before
 # computing percentiles -- this is a *display* table, not an analysis statistic,
 # so dynamic range shouldn't depend on how much non-expressing "blank space"
 # surrounds the signal, mirroring the image side's own zero-pixel exclusion.
-_TRANSCRIPT_ALPHA_PCT_KEYS = [0.1, 1, 5, 25, 50, 95, 99, 100]
+_TRANSCRIPT_DISPLAY_STATS_PCT_KEYS = [0.1, 1, 5, 25, 50, 95, 99, 100]
 
 # Genes with fewer than this many total counts skip the full percentile
 # computation -- checked 2026-08-26 against a real 549K-spot / 19K-gene whole-
@@ -146,12 +149,12 @@ _TRANSCRIPT_ALPHA_PCT_KEYS = [0.1, 1, 5, 25, 50, 95, 99, 100]
 # handful of genuinely high cells or noise scattered everywhere; neither case
 # is usefully described by a table of percentiles. Cheap to tune
 # later -- doesn't force a version bump, see genes_reduced below.
-_TRANSCRIPT_ALPHA_MIN_SUM = 250
+_TRANSCRIPT_DISPLAY_STATS_MIN_SUM = 250
 
 
 def _percentile_row(values: np.ndarray) -> list:
     """
-    Shared tail of the transcript_alpha per-gene stat row: 8 percentiles computed
+    Shared tail of the transcript_display_stats per-gene stat row: 8 percentiles computed
     over nonzero values only, + rank of the first nonzero entry in the full
     ascending-sorted array (zeros included -- a cheap zero-fraction proxy), + sum
     of all values (not derivable from the percentiles, and the most commonly
@@ -161,11 +164,11 @@ def _percentile_row(values: np.ndarray) -> list:
     first_nonzero_rank = int(np.searchsorted(values, 1))
     nonzero = values[first_nonzero_rank:]
     pct_source = nonzero if len(nonzero) > 0 else values
-    percentiles = np.percentile(pct_source, _TRANSCRIPT_ALPHA_PCT_KEYS).tolist()
+    percentiles = np.percentile(pct_source, _TRANSCRIPT_DISPLAY_STATS_PCT_KEYS).tolist()
     return percentiles + [first_nonzero_rank, float(values.sum())]
 
 
-def build_transcript_alpha_table(adata, platform: str, bin_um: Optional[float] = None,
+def build_transcript_display_stats_table(adata, platform: str, bin_um: Optional[float] = None,
                                   gene_col: str = 'feature'):
     """
     Precompute a small per-gene percentile table for fast display/contrast
@@ -198,7 +201,7 @@ def build_transcript_alpha_table(adata, platform: str, bin_um: Optional[float] =
         the sparse groupby result is sufficient and stays O(N) regardless of
         how many bins bin_um produces.
 
-    Genes with fewer than _TRANSCRIPT_ALPHA_MIN_SUM total counts skip the full
+    Genes with fewer than _TRANSCRIPT_DISPLAY_STATS_MIN_SUM total counts skip the full
     percentile computation entirely and get a cheap [max, sum] pair in
     'genes_reduced' instead -- below that floor, a gene's signal is either a
     handful of genuinely high cells or scattered noise, and neither case is
@@ -208,11 +211,11 @@ def build_transcript_alpha_table(adata, platform: str, bin_um: Optional[float] =
     sum first avoids that cost for the ~30%+ of genes typically below floor in
     real whole-transcriptome data.
 
-    Returns a dict ready to be JSON-stringified into adata.uns['transcript_alpha']:
+    Returns a dict ready to be JSON-stringified into adata.uns['transcript_display_stats']:
         {'bin_um': <the spatial bin size, in microns, the stats were computed
                     over -- histogram tile size for xenium, source spot-bin
                     level for visium (set by the caller for visium; None here)>,
-         'min_sum_threshold': _TRANSCRIPT_ALPHA_MIN_SUM,
+         'min_sum_threshold': _TRANSCRIPT_DISPLAY_STATS_MIN_SUM,
          'genes': {gene: [p0.1, p1, p5, p25, p50, p95, p99, p100,
                            first_nonzero_rank, sum], ...},
          'genes_reduced': {gene: [max, sum], ...}}
@@ -222,7 +225,7 @@ def build_transcript_alpha_table(adata, platform: str, bin_um: Optional[float] =
         if gene_col not in adata.obs.columns or 'spatial' not in adata.obsm:
             return None
         if bin_um is None:
-            raise ValueError("bin_um is required to build transcript_alpha for a xenium channel")
+            raise ValueError("bin_um is required to build transcript_display_stats for a xenium channel")
 
         coords = adata.obsm['spatial']
         genes_arr = np.asarray(adata.obs[gene_col].values)
@@ -254,15 +257,15 @@ def build_transcript_alpha_table(adata, platform: str, bin_um: Optional[float] =
             total = int(gene_totals[gene_code])
             nonzero_vals = per_gene.to_numpy()  # this gene's nonzero per-bin counts only
 
-            if total < _TRANSCRIPT_ALPHA_MIN_SUM:
+            if total < _TRANSCRIPT_DISPLAY_STATS_MIN_SUM:
                 genes_reduced[str(gene)] = [float(nonzero_vals.max()), float(total)]
             else:
                 nonzero_sorted = np.sort(nonzero_vals)
                 first_nonzero_rank = n_bins - len(nonzero_sorted)  # = count of zero bins
-                percentiles = np.percentile(nonzero_sorted, _TRANSCRIPT_ALPHA_PCT_KEYS).tolist()
+                percentiles = np.percentile(nonzero_sorted, _TRANSCRIPT_DISPLAY_STATS_PCT_KEYS).tolist()
                 gene_table[str(gene)] = percentiles + [int(first_nonzero_rank), float(total)]
 
-        return {'bin_um': float(bin_um), 'min_sum_threshold': _TRANSCRIPT_ALPHA_MIN_SUM,
+        return {'bin_um': float(bin_um), 'min_sum_threshold': _TRANSCRIPT_DISPLAY_STATS_MIN_SUM,
                 'genes': gene_table, 'genes_reduced': genes_reduced}
 
     else:  # visium (and other binned platforms with a genuine spot x gene matrix)
@@ -279,7 +282,7 @@ def build_transcript_alpha_table(adata, platform: str, bin_um: Optional[float] =
         gene_table, genes_reduced = {}, {}
         for i, gene in enumerate(adata.var_names):
             col = X[:, i]
-            if gene_sums[i] < _TRANSCRIPT_ALPHA_MIN_SUM:
+            if gene_sums[i] < _TRANSCRIPT_DISPLAY_STATS_MIN_SUM:
                 # Skip densifying the full column for low-signal genes -- just
                 # need the max, which sparse .data (nonzero entries only) gives
                 # directly without materializing all n_spots values.
@@ -296,7 +299,7 @@ def build_transcript_alpha_table(adata, platform: str, bin_um: Optional[float] =
                 col = col.toarray().ravel() if sp.issparse(col) else np.asarray(col).ravel()
                 gene_table[str(gene)] = _percentile_row(col)
 
-        return {'bin_um': None, 'min_sum_threshold': _TRANSCRIPT_ALPHA_MIN_SUM,
+        return {'bin_um': None, 'min_sum_threshold': _TRANSCRIPT_DISPLAY_STATS_MIN_SUM,
                 'genes': gene_table, 'genes_reduced': genes_reduced}
 
 
@@ -352,9 +355,9 @@ def _sanitize_for_zarr(obj: Any) -> Any:
 ## including metadta and ROIs.
 ################################
 
-def _derive_transcript_alpha_bin_um(sample: SampleSet, omic_chan: OmicChannel) -> float:
+def _derive_transcript_display_stats_bin_um(sample: SampleSet, omic_chan: OmicChannel) -> float:
     """
-    Picks a spatial bin size for transcript_alpha's Xenium pseudo-render
+    Picks a spatial bin size for transcript_display_stats's Xenium pseudo-render
     histogram: the second-coarsest level of an image channel's pyramid in the
     same sample (any one -- they're registered to the same coordinate system,
     so which specific channel doesn't matter). Deliberately not the coarsest
@@ -424,60 +427,84 @@ def save_sample(
 
     if sample.images:
         morph_path = out_path / "morph.zarr"
-        
+
         # Explicitly remove existing morph directory if overwrite is enabled
         if overwrite and morph_path.exists():
             shutil.rmtree(morph_path, onexc=_remove_readonly)
-        
+
         morph_path.mkdir(parents=True, exist_ok=True)
-        
+
+        import ome_zarr.writer as ome_writer
+        import ome_zarr.format as ome_format
+
+        root: Any = zarr.open_group(str(morph_path), mode='a')  # type: ignore
+        # ome_zarr's write_multiscale() still passes a singular 'compressor'
+        # through to da.to_zarr() (not yet updated for zarr's current
+        # 'compressors' kwarg -- confirmed harmless, just a deprecation
+        # warning, nothing platpy can fix on its own side).
+        ome_compressor = compressors[0]
+
         for name, img_chan in sample.images.items():
             img_data = img_chan.image
-            
-            root: Any = zarr.open_group(str(morph_path), mode='a') # type: ignore
-            chunks = (1024, 1024, 3) if img_data.ndim == 3 else (1024, 1024)
-            z = root.require_dataset(
-                name, shape=img_data.shape, chunks=chunks,
-                dtype=img_data.dtype, overwrite=True, compressors=compressors
+            is_rgb = img_data.ndim == 3
+            # OME-NGFF requires non-space axes before space axes -- 'c' must
+            # come before 'y'/'x', the reverse of platpy's own (H, W, C)
+            # convention, so the array itself needs moveaxis'ing to match,
+            # not just the axes label list.
+            axes = ['c', 'y', 'x'] if is_rgb else ['y', 'x']
+            chunks = (3, 1024, 1024) if is_rgb else (1024, 1024)
+
+            base_mpp = float(img_chan.spatial_meta.transform_matrix[0, 0])
+            tx = float(img_chan.spatial_meta.transform_matrix[0, 2])
+            ty = float(img_chan.spatial_meta.transform_matrix[1, 2])
+
+            def _to_ome_axes(arr):
+                return da.moveaxis(arr, -1, 0) if (is_rgb and isinstance(arr, da.Array)) else (
+                    np.moveaxis(arr, -1, 0) if is_rgb else arr)
+
+            # Base level + persisted pyramid levels (skipped when
+            # persist_pyramid=False, e.g. Xenium channels that already have
+            # _hires/_lowres companions acting as the pyramid), largest/finest
+            # first -- write_multiscale()'s required order.
+            levels = {base_mpp: img_data}
+            if img_chan.persist_pyramid:
+                levels.update(img_chan.pyramid)
+            sorted_mpps = sorted(levels.keys())
+            pyramid_arrays = [_to_ome_axes(levels[m]) for m in sorted_mpps]
+
+            coordinate_transformations = []
+            for mpp in sorted_mpps:
+                scale = [1.0, mpp, mpp] if is_rgb else [mpp, mpp]
+                translation = [0.0, ty, tx] if is_rgb else [ty, tx]
+                coordinate_transformations.append([
+                    {'type': 'scale', 'scale': scale},
+                    {'type': 'translation', 'translation': translation},
+                ])
+
+            if overwrite and name in root:
+                del root[name]
+            chan_group = root.require_group(name)
+            ome_writer.write_multiscale(
+                pyramid=pyramid_arrays,
+                group=chan_group,
+                fmt=ome_format.FormatV05(),
+                axes=axes,
+                coordinate_transformations=coordinate_transformations,
+                storage_options={'chunks': chunks, 'compressor': ome_compressor},
             )
-            if isinstance(img_data, da.Array):
-                da.store(img_data, z)
-            else:
-                z[:] = img_data
-            
-            safe_matrix = np.array(img_chan.spatial_meta.transform_matrix).tolist()
-            meta_dict = {
-                'transform_matrix': safe_matrix,
-                'local_bounds': img_chan.spatial_meta.local_bounds,
+
+            # Non-standard extras platpy still needs, alongside the 'ome' key
+            # write_multiscale() already wrote above -- the spec permits
+            # additional attrs it doesn't define, so these just ride along.
+            chan_group.attrs['platpy_meta'] = _sanitize_for_zarr({
                 'unit': img_chan.spatial_meta.unit,
                 'name': img_chan.name,
                 'base_layer': img_chan.base_layer,
-                'user_metadata': img_chan.metadata
-            }
-            root[name].attrs.put(meta_dict) # type: ignore
+                'user_metadata': img_chan.metadata,
+            })
 
-            # Save pre-computed pyramid levels so renders don't re-derive from full-res.
-            # Skipped when persist_pyramid=False (e.g. Xenium channels that already have
-            # _hires/_lowres companions acting as the pyramid).
-            # Key format: {name}__pyr{factor} where factor = 2, 4, 8, ...
-            base_mpp = img_chan.spatial_meta.transform_matrix[0, 0]
-            for level_mpp, level_arr in img_chan.pyramid.items():
-                if abs(level_mpp - base_mpp) < 1e-9:
-                    continue  # skip base level — already saved as the main component
-                factor = round(level_mpp / base_mpp)
-                pyr_key = f"{name}__pyr{factor}"
-                pyr_chunks = (1024, 1024, 3) if level_arr.ndim == 3 else (1024, 1024)
-                zp = root.require_dataset(
-                    pyr_key, shape=level_arr.shape, chunks=pyr_chunks,
-                    dtype=level_arr.dtype, overwrite=True, compressors=compressors
-                )
-                if isinstance(level_arr, da.Array):
-                    da.store(level_arr, zp)
-                else:
-                    zp[:] = level_arr
-                root[pyr_key].attrs.put({'mpp': float(level_mpp)})
-
-            logger.info(f"  + Saved Image: {name} ({len(img_chan.pyramid)} pyramid level(s), clevel={clevel})")
+            logger.info(f"  + Saved Image (OME-Zarr 0.5): {name} "
+                        f"({len(pyramid_arrays)} level(s), clevel={clevel})")
 
     # ========
     # 2. Save Omics (omics/{name}/ pyramid directory, one zarr per level)
@@ -503,9 +530,33 @@ def save_sample(
             spatial_list = np.array(omic_chan.spatial_meta.transform_matrix).tolist()
             channel_meta = _sanitize_for_zarr(omic_chan.metadata)
             platform = omic_chan.metadata.get('platform', 'visium')
-            alpha_bin_um = _derive_transcript_alpha_bin_um(sample, omic_chan) if platform == 'xenium' else None
+            stats_bin_um = _derive_transcript_display_stats_bin_um(sample, omic_chan) if platform == 'xenium' else None
 
-            # Compute transcript_alpha ONCE from a single reference level, not once per
+            # Normalize every pyramid level to a real AnnData up front -- write_zarr
+            # needs real data regardless, and a LazyTranscripts level (a sample
+            # loaded lazily and resaved without ever being cropped) only gets
+            # materialized once here, reused below for both the stats reference
+            # level and the actual write, rather than pulling the full table from
+            # zarr twice. A plain resave's row order/blocks are unchanged from the
+            # original load, so the existing block_index (and anything else in
+            # LazyTranscripts.uns) carries straight over instead of being rebuilt.
+            from .lazy_transcripts import LazyTranscripts
+            normalized_pyramid = {}
+            for bin_um, level_data in omic_chan.pyramid.items():
+                if isinstance(level_data, LazyTranscripts):
+                    df = level_data.materialize()
+                    df.index = df.index.astype(str)
+                    level_adata = ad.AnnData(obs=df)
+                    level_adata.obsm['spatial'] = df[['x', 'y']].to_numpy()
+                    for k, v in level_data.uns.items():
+                        level_adata.uns[k] = v
+                elif isinstance(level_data, pd.DataFrame):
+                    level_adata = ad.AnnData(obs=level_data)
+                else:
+                    level_adata = level_data
+                normalized_pyramid[bin_um] = level_adata
+
+            # Compute transcript_display_stats ONCE from a single reference level, not once per
             # pyramid level -- otherwise each resolution's table would be individually
             # noisy (Visium's 4um bins in particular). Mirrors the image side's own
             # choice to compute display_stats from one smooth thumbnail regardless of
@@ -513,28 +564,24 @@ def save_sample(
             # "not the single coarsest option" principle as the Xenium bin_um choice
             # above -- coarsest available today is 16um, so this lands on 8um).
             # For Xenium there's only ever one pyramid entry (the 0.0 flag) anyway.
-            alpha_table = None
-            if omic_chan.pyramid:
-                levels_sorted = sorted(omic_chan.pyramid.keys())
+            stats_table = None
+            if normalized_pyramid:
+                levels_sorted = sorted(normalized_pyramid.keys())
                 ref_level = levels_sorted[0] if platform == 'xenium' else (
                     levels_sorted[-2] if len(levels_sorted) >= 2 else levels_sorted[-1]
                 )
-                ref_adata = omic_chan.pyramid[ref_level]
-                if isinstance(ref_adata, pd.DataFrame):
-                    ref_adata = ad.AnnData(obs=ref_adata)
-                alpha_table = build_transcript_alpha_table(ref_adata, platform, bin_um=alpha_bin_um)
-                if platform != 'xenium' and alpha_table is not None:
-                    alpha_table['bin_um'] = float(ref_level)  # which spot-bin level was used
+                ref_adata = normalized_pyramid[ref_level]
+                stats_table = build_transcript_display_stats_table(ref_adata, platform, bin_um=stats_bin_um)
+                if platform != 'xenium' and stats_table is not None:
+                    stats_table['bin_um'] = float(ref_level)  # which spot-bin level was used
 
-            for bin_um, adata_level in omic_chan.pyramid.items():
-                if isinstance(adata_level, pd.DataFrame):
-                    adata_level = ad.AnnData(obs=adata_level)
+            for bin_um, adata_level in normalized_pyramid.items():
                 adata_level.uns['spatial_meta'] = spatial_list
                 adata_level.uns['channel_meta'] = channel_meta
 
-                if alpha_table is not None:
-                    adata_level.uns['transcript_alpha'] = json.dumps(alpha_table)
-                    adata_level.uns['opt_transcript_alpha_version'] = OPT_TRANSCRIPT_ALPHA_VERSION
+                if stats_table is not None:
+                    adata_level.uns['transcript_display_stats'] = json.dumps(stats_table)
+                    adata_level.uns['opt_transcript_display_stats_version'] = OPT_TRANSCRIPT_DISPLAY_STATS_VERSION
 
                 dest_path = chan_dir / f"{float(bin_um):.1f}um.zarr"
                 adata_level.write_zarr(dest_path)
@@ -556,12 +603,17 @@ def save_sample(
             logger.info(f"  + Built default cell x gene matrix "
                         f"({default_cells.n_obs:,} cells x {default_cells.n_vars:,} genes)")
 
+        from .lazy_value import resolve as _resolve_lazy
+
         for name, cell_chan in sample.cells.items():
             dest_path = cells_dir / f"{name}.zarr"
             if overwrite and dest_path.exists():
                 shutil.rmtree(dest_path, onexc=_remove_readonly)
-                
-            adata: Any = cell_chan.boundaries
+
+            # A resave always needs the real boundaries/data regardless of
+            # whether anything touched them yet -- write_zarr() needs actual
+            # bytes either way, so there's no deferred-write equivalent here.
+            adata: Any = _resolve_lazy(cell_chan.boundaries)
             if isinstance(adata, pd.DataFrame):
                 df_obs = adata.reset_index(drop=True)
                 df_obs.index = df_obs.index.astype(str)
@@ -586,12 +638,13 @@ def save_sample(
             # own zarr since it's one row per cell, a different row count than
             # the per-vertex boundaries table.
             if cell_chan.data is not None:
+                cell_data = _resolve_lazy(cell_chan.data)
                 data_path = cells_dir / f"{name}_cells.zarr"
                 if overwrite and data_path.exists():
                     shutil.rmtree(data_path, onexc=_remove_readonly)
-                cell_chan.data.write_zarr(data_path)
+                cell_data.write_zarr(data_path)
                 logger.info(f"  + Saved Cell x Gene Matrix: {name} "
-                            f"({cell_chan.data.n_obs:,} cells x {cell_chan.data.n_vars:,} genes)")
+                            f"({cell_data.n_obs:,} cells x {cell_data.n_vars:,} genes)")
 
             logger.info(f"  + Saved Cell Channel: {name}")
 
@@ -650,38 +703,64 @@ def load_sample(in_path_str: str, verbose: bool = True, load_2um_bin: bool = Fal
     morph_path = in_path / "morph.zarr"
     summary_list = []
     if morph_path.exists():
+        from .transform_utils import create_transform_matrix
+
         # Open with mode='r' (zarr auto-detects version on read)
         root: Any = zarr.open_group(str(morph_path), mode='r') # type: ignore
-        for name in root.array_keys():
-            if '__pyr' in name:
-                continue  # pyramid level — attached to parent channel below
-            z_arr = root[name]
-            d_arr = da.from_zarr(z_arr)
+        for name in root.group_keys():
+            chan_group = root[name]
+            ome_meta = chan_group.attrs.get('ome', {}).get('multiscales', [{}])[0]
+            platpy_meta = chan_group.attrs.get('platpy_meta', {})
+            axes = [a['name'] for a in ome_meta.get('axes', [{'name': 'y'}, {'name': 'x'}])]
+            y_idx, x_idx = axes.index('y'), axes.index('x')
+            c_idx = axes.index('c') if 'c' in axes else None
+
+            # Parse every dataset entry once into (mpp -> (array, tx, ty)) --
+            # avoids a second pass to recover the base level's own translation.
+            # Arrays get moveaxis'd back to platpy's native (y, x[, c]) order
+            # here too -- OME-NGFF requires 'c' before the space axes, the
+            # reverse of platpy's own (H, W, C) convention -- so every other
+            # line below can just assume that native order, not OME's.
+            levels: Dict[float, Any] = {}
+            translations: Dict[float, Tuple[float, float]] = {}
+            for ds in ome_meta.get('datasets', []):
+                xforms = {t['type']: t for t in ds['coordinateTransformations']}
+                mpp = float(xforms['scale']['scale'][x_idx])
+                translation = xforms['translation']['translation']
+                arr = da.from_zarr(chan_group[ds['path']])
+                if c_idx is not None:
+                    arr = da.moveaxis(arr, c_idx, -1)
+                levels[mpp] = arr
+                translations[mpp] = (float(translation[x_idx]), float(translation[y_idx]))
+
+            if not levels:
+                continue  # malformed/empty channel group -- nothing to load
+
+            base_mpp = min(levels.keys())
+            d_arr = levels[base_mpp]
             info_str = _get_channel_info_string(d_arr)
             summary_list.append(f"'{name}' ({info_str})")
-            
-            attrs = z_arr.attrs.asdict() # type: ignore
+            tx, ty = translations[base_mpp]
+
+            h_px, w_px = d_arr.shape[0], d_arr.shape[1]
             spatial = SpatialMetadata(
-                transform_matrix=np.array(attrs.get('transform_matrix', np.eye(3))),
-                local_bounds=attrs.get('local_bounds'),
-                unit=attrs.get('unit', 'microns')
+                transform_matrix=create_transform_matrix(scale_x=base_mpp, scale_y=base_mpp, tx=tx, ty=ty),
+                local_bounds=(0.0, float(w_px), 0.0, float(h_px)),
+                unit=platpy_meta.get('unit', 'microns')
             )
             img_chan = ImageChannel(
-                name=attrs.get('name', name),
+                name=platpy_meta.get('name', name),
                 image=d_arr,
                 spatial_meta=spatial,
-                metadata=attrs.get('user_metadata', {})
+                metadata=platpy_meta.get('user_metadata', {})
             )
-            img_chan.base_layer = attrs.get('base_layer', None)
+            img_chan.base_layer = platpy_meta.get('base_layer', None)
 
-            # Load pre-computed pyramid levels if saved; otherwise generate on-the-fly.
-            pyr_keys = [k for k in root.array_keys() if k.startswith(f"{name}__pyr")]
-            if pyr_keys:
-                for pyr_key in pyr_keys:
-                    level_mpp = root[pyr_key].attrs.asdict().get('mpp')
-                    if level_mpp is not None:
-                        img_chan.pyramid[float(level_mpp)] = da.from_zarr(root[pyr_key])
-            else:
+            for mpp, level_arr in levels.items():
+                if abs(mpp - base_mpp) < 1e-9:
+                    continue  # base level — already img_chan.image
+                img_chan.pyramid[mpp] = level_arr
+            if not img_chan.pyramid:
                 img_chan.generate_pyramid()
 
             sample.images[name] = img_chan
@@ -726,19 +805,51 @@ def load_sample(in_path_str: str, verbose: bool = True, load_2um_bin: bool = Fal
             if not level_files:
                 continue
 
+            # A single level stored at the 0.0 sentinel is how continuous point
+            # clouds (Xenium transcripts) are always saved (__post_init__ /
+            # save_sample()) -- Visium's real binned pyramids always have 2+
+            # levels. Peek channel_meta cheaply (a handful of scalars, not the
+            # row data) via zarr directly to confirm before committing to the
+            # lazy path -- ad.read_zarr() is exactly the eager read this is
+            # meant to avoid.
+            is_lazy_candidate = (
+                len(level_files) == 1
+                and _parse_bin_um(level_files[0]) == 0.0
+            )
+            if is_lazy_candidate:
+                from .lazy_transcripts import read_zarr_scalar_dict, load_transcripts_lazy
+                probe_root = zarr.open_group(str(level_files[0]), mode='r')
+                probe_meta = (read_zarr_scalar_dict(probe_root['uns']['channel_meta'])
+                              if 'uns' in probe_root and 'channel_meta' in probe_root['uns'] else {})
+                is_lazy_candidate = (probe_meta.get('platform') == 'xenium'
+                                      and bool(probe_meta.get('is_continuous')))
+
             pyramid: Dict[float, Any] = {}
             spatial_mat = np.eye(3)
             channel_meta: Dict[str, Any] = {}
-            for level_path in level_files:
-                bin_um = float(level_path.stem.replace('um', ''))
+
+            if is_lazy_candidate:
+                level_path = level_files[0]
                 try:
-                    adata = ad.read_zarr(level_path)
+                    lazy_data = load_transcripts_lazy(level_path)
                 except Exception as e:
-                    print(f"  [load_sample] WARNING: could not read {level_path.name} in {chan_dir.name}/ — skipping ({type(e).__name__}: {e})")
-                    continue
-                spatial_mat = np.array(adata.uns.get('spatial_meta', np.eye(3)))
-                channel_meta = adata.uns.get('channel_meta', {})
-                pyramid[bin_um] = adata
+                    print(f"  [load_sample] WARNING: could not lazily read {level_path.name} in {chan_dir.name}/ — skipping ({type(e).__name__}: {e})")
+                    lazy_data = None
+                if lazy_data is not None:
+                    spatial_mat = np.array(lazy_data.uns.get('spatial_meta', np.eye(3)))
+                    channel_meta = probe_meta
+                    pyramid[0.0] = lazy_data
+            else:
+                for level_path in level_files:
+                    bin_um = float(level_path.stem.replace('um', ''))
+                    try:
+                        adata = ad.read_zarr(level_path)
+                    except Exception as e:
+                        print(f"  [load_sample] WARNING: could not read {level_path.name} in {chan_dir.name}/ — skipping ({type(e).__name__}: {e})")
+                        continue
+                    spatial_mat = np.array(adata.uns.get('spatial_meta', np.eye(3)))
+                    channel_meta = adata.uns.get('channel_meta', {})
+                    pyramid[bin_um] = adata
 
             if not load_2um_bin and 2.0 in pyramid and 4.0 in pyramid:
                 del pyramid[2.0]
@@ -766,6 +877,9 @@ def load_sample(in_path_str: str, verbose: bool = True, load_2um_bin: bool = Fal
 
     cells_dir = in_path / "cells"
     if cells_dir.exists():
+        from .lazy_value import Deferred
+        from .lazy_transcripts import read_zarr_scalar_dict
+
         for cell_path in cells_dir.glob("*.zarr"):
             # {name}_cells.zarr is the cached default cell x gene matrix for
             # the "{name}" channel this loop is building, not a boundary
@@ -773,12 +887,24 @@ def load_sample(in_path_str: str, verbose: bool = True, load_2um_bin: bool = Fal
             if cell_path.stem.endswith('_cells'):
                 continue
             name = cell_path.stem
-            adata = ad.read_zarr(cell_path)
-            spatial_mat = np.array(adata.uns.get('spatial_meta', np.eye(3)))
+
+            # Neither .boundaries (a per-vertex polygon table that can run to
+            # tens-hundreds of MB) nor .data (the cached cell x gene matrix)
+            # get loaded here -- only something that actually touches them
+            # should pay for it. spatial_meta/channel_meta are still needed
+            # up front though, so peek them cheaply (a 3x3 array, a handful
+            # of scalars) directly via zarr rather than through ad.read_zarr(),
+            # which would materialize the whole vertex table just to read a
+            # few small uns entries.
+            probe_root = zarr.open_group(str(cell_path), mode='r')
+            probe_uns = probe_root['uns'] if 'uns' in probe_root else None
+            spatial_mat = (np.array(probe_uns['spatial_meta'][()])
+                           if probe_uns is not None and 'spatial_meta' in probe_uns else np.eye(3))
+            channel_meta = (read_zarr_scalar_dict(probe_uns['channel_meta'])
+                            if probe_uns is not None and 'channel_meta' in probe_uns else {})
             spatial = SpatialMetadata(transform_matrix=spatial_mat)
 
-            # FIX: Restore the channel metadata
-            channel_meta = adata.uns.get('channel_meta', {})
+            boundaries = Deferred(loader=lambda p=cell_path: ad.read_zarr(p))
 
             summary_path = cells_dir / f"{name}_summary.parquet"
             summary = pd.read_parquet(summary_path) if summary_path.exists() else None
@@ -787,14 +913,19 @@ def load_sample(in_path_str: str, verbose: bool = True, load_2um_bin: bool = Fal
             # build_default_cells). Built once at save time and never mutated
             # afterward, so skipping AnnData's O(n) obs-index uniqueness check
             # on reload is safe by construction -- the index was already
-            # validated the one time it was created.
+            # validated the one time it was created. check_uniqueness=False
+            # only needs to apply while THIS load actually runs, not globally,
+            # so it's set inside the deferred loader itself rather than around
+            # this whole function.
             data_path = cells_dir / f"{name}_cells.zarr"
             data = None
             if data_path.exists():
-                with ad.settings.override(check_uniqueness=False):
-                    data = ad.read_zarr(data_path)
+                def _load_cell_data(p=data_path):
+                    with ad.settings.override(check_uniqueness=False):
+                        return ad.read_zarr(p)
+                data = Deferred(loader=_load_cell_data)
 
-            cell_chan = CellChannel(name=name, boundaries=adata, data=data, summary=summary,
+            cell_chan = CellChannel(name=name, boundaries=boundaries, data=data, summary=summary,
                                      spatial_meta=spatial, metadata=channel_meta)
             sample.cells[name] = cell_chan
 
