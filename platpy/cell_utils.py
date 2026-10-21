@@ -39,7 +39,7 @@ def _encode_coord(val_um, precision=10):
 # builds (adata.uns['build_cells_xenium_version']) so a save-time cache from
 # an older platpy is never silently trusted as if it were current -- see
 # save_sample()'s build_default_cells handling in io_utils.py.
-BUILD_CELLS_XENIUM_VERSION = 1
+BUILD_CELLS_XENIUM_VERSION = 2
 
 
 def build_cells_xenium(sample, roi=None, discard_straddlers: bool = True,
@@ -221,8 +221,13 @@ def build_cells_xenium(sample, roi=None, discard_straddlers: bool = True,
     cell_idx = {c: i for i, c in enumerate(cells)}
     gene_idx = {g: i for i, g in enumerate(genes)}
 
-    rows = tx['cell_id'].map(cell_idx).values
-    cols = tx['feature'].map(gene_idx).values
+    # int32 rather than pandas' default int64 for these -- cell/gene counts
+    # are nowhere near int32's ~2.1 billion ceiling for any realistic single
+    # section, and indices/indptr dominate a sparse matrix's memory footprint
+    # (bigger than the actual float32 data for a typical count matrix), so
+    # this roughly halves the matrix's size for free.
+    rows = tx['cell_id'].map(cell_idx).values.astype(np.int32)
+    cols = tx['feature'].map(gene_idx).values.astype(np.int32)
 
     # One transcript = one count; sparse to keep memory low
     X = sp.csr_matrix(
