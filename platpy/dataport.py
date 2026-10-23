@@ -284,12 +284,18 @@ class DataPort:
         pixel, so the true tile can be up to one pixel-width larger than the
         grid math above on each edge.
 
-        Tiling itself is only partially implemented: the DataPort can break the
-        ROI up into tiles and hand each one to your function, but stitching the
-        return values back together (merging/deduplicating results across tile
-        boundaries) has not been implemented yet -- that's a future goal. Every
-        call warns for this reason; see overlap_um below for the sharpest case
-        of why that matters.
+        Tiling here is intentionally just the split, not the merge: DataPort
+        breaks the ROI up into tiles and hands each one to your function, but
+        does not stitch results back together (merging/deduplicating across
+        tile boundaries). This is meant for tools that handle their own
+        internal tiling against memory/GPU limits already (e.g. Cellpose's
+        own tile=True, StarDist's predict_instances_big()) -- for those, just
+        pass the full extracted array and skip tile_size_um entirely. Use
+        tile_size_um only for a function that does NOT manage its own tiling;
+        in that case stitching the returned per-tile results back together
+        (deduping objects that straddle a tile boundary) is on the caller --
+        DataPort does not do it. Every call warns for this reason; see
+        overlap_um below for the sharpest case of why that matters.
 
         Args:
             channel:        The ImageChannel to tile.
@@ -390,8 +396,11 @@ class DataPort:
         independently. Extraction is the bounding box of the ROI polygon; the polygon
         itself is returned so callers can apply fine-grained masking if needed.
 
-        TODO: implement polygon masking inside the bounding box crop so pixels
-        outside the ROI shape are zeroed rather than just bbox-cropped.
+        Not implemented: polygon masking inside the bounding box crop (so
+        pixels outside the ROI shape would be zeroed rather than just
+        bbox-cropped). Unrelated to tiles()/process()'s tiling-vs-stitching
+        gap above -- this one is about per-ROI polygon precision, not
+        splitting a large region into tiles.
         """
         _ = channel, roi_name  # parameters reserved for implementation
         raise NotImplementedError("tiles_by_roi is not yet implemented.")
@@ -414,11 +423,15 @@ class DataPort:
         If tile_size_um is None, the full ROI is extracted and fn is called once.
         If tile_size_um is set, fn is called on each tile independently.
 
-        Tiling is partially implemented here: the DataPort can break the ROI up
-        into tiles and hand each one to fn, but stitching the return values back
-        together (merging/deduplicating results across tile boundaries) has not
-        been implemented yet -- that's a future goal. Using tile_size_um always
-        warns for this reason.
+        Tiling here is intentionally just the split, not the merge (see
+        tiles()'s docstring for the full reasoning): this exists for a fn that
+        does NOT already manage its own tiling against memory/GPU limits. If
+        fn already does (Cellpose's tile=True, StarDist's
+        predict_instances_big(), etc.), skip tile_size_um and just call
+        process() with the whole ROI -- let fn handle it internally. When
+        tile_size_um IS used, DataPort does not stitch/deduplicate results
+        across tile boundaries; that's on the caller. Using tile_size_um
+        always warns for this reason.
 
         Args:
             channel:        The ImageChannel to extract from.
