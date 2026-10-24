@@ -5,7 +5,6 @@ from pathlib import Path
 from typing import Optional
 import numpy as np
 import pandas as pd
-import anndata as ad
 import dask
 import dask.array as da
 import tifffile
@@ -13,10 +12,32 @@ import tifffile
 # Import core platpy architecture (Visium Parity)
 from .channels import SampleSet, CellChannel, ImageChannel, OmicChannel
 from .transform_utils import SpatialMetadata, create_transform_matrix
-from .io_utils import build_spatial_block_index
+from .io_utils import build_spatial_block_index, OPT_BLOCK_INDEX_VERSION
 
 # Set up library-level logger
 logger = logging.getLogger(__name__)
+
+
+def _read_tiff_level(img_path: Path, level: int) -> np.ndarray:
+    """
+    Reads one pyramid level's pixel data via its own freshly-opened
+    tifffile.TiffFile handle, rather than a handle shared with other levels.
+
+    load_xenium() wraps each level's read in dask.delayed() for lazy loading
+    -- these only actually execute later, at save_sample() time, under
+    dask's default threaded scheduler, which can run them concurrently.
+    tifffile's FileHandle tracks a single read position per open file; two
+    levels sharing one handle and reading concurrently can have their
+    seek+read calls interleave, so one thread ends up decoding bytes read at
+    another thread's offset. Seen in production as an intermittent
+    "not a J2K or JP2 data stream" JPEG2000 decode error on otherwise-valid
+    tiles (confirmed via standalone decode of every tile in the failing
+    file -- the bytes on disk are fine). A fresh handle per delayed call has
+    its own independent file descriptor/read position, so concurrent reads
+    can't corrupt each other.
+    """
+    with tifffile.TiffFile(img_path, is_ome=False) as tif:
+        return tif.series[0].levels[level].asarray()
 
 def _polygon_summary(vertices: pd.DataFrame) -> pd.DataFrame:
     """
@@ -61,7 +82,7 @@ def _polygon_summary(vertices: pd.DataFrame) -> pd.DataFrame:
         'cross':    cross,
         'cx_term':  (x + x_next) * cross,
         'cy_term':  (y + y_next) * cross,
-    }).groupby('cell_id', sort=False).sum()
+    }).groupby('cell_id', sort=False, observed=True).sum()
 
     signed_area2 = agg['cross']  # = 2x the signed polygon area
     area_um2 = (signed_area2 / 2.0).abs()
@@ -74,12 +95,12 @@ def _polygon_summary(vertices: pd.DataFrame) -> pd.DataFrame:
     # can't use the area-weighted formula; fall back to a plain vertex mean.
     degenerate = signed_area2.abs() < 1e-6
     if degenerate.any():
-        g = df.groupby('cell_id', sort=False)
+        g = df.groupby('cell_id', sort=False, observed=True)
         vx_mean, vy_mean = g['x'].mean(), g['y'].mean()
         cx = cx.where(~degenerate, vx_mean)
         cy = cy.where(~degenerate, vy_mean)
 
-    g = df.groupby('cell_id', sort=False)
+    g = df.groupby('cell_id', sort=False, observed=True)
     summary = pd.DataFrame({
         'x':          cx,
         'y':          cy,
@@ -116,6 +137,15 @@ def _load_boundaries(x_dir: Path) -> Optional[CellChannel]:
         if rename_map:
             df = df.rename(columns=rename_map)
 
+        # cell_id as categorical instead of raw object/string -- confirmed
+        # 2026-10-23 this is 81% of this table's in-memory footprint (467MB
+        # of 579MB on a 279K-cell/6.98M-vertex run) despite being tiny on
+        # disk (24.5MB parquet), same shape of issue already fixed for
+        # transcripts' feature/cell_id columns. Also speeds up the groupby
+        # calls in _polygon_summary() below and downstream (build_cells_xenium
+        # etc.) -- categorical code comparisons are cheaper than string ones.
+        df['cell_id'] = df['cell_id'].astype('category')
+
         summary = _polygon_summary(df)
         logger.info(f"     + Derived per-cell centroid/area for {len(summary):,} cells")
 
@@ -139,16 +169,35 @@ def _load_transcripts(x_dir: Path) -> Optional[OmicChannel]:
         logger.info(f"   - Loading Transcripts: {tx_path.name}")
         
         # Core columns needed for 2D spatial omics
-        # (Dropping z_location, overlaps_nucleus, etc., to save massive RAM)
+        # (Dropping z_location, overlaps_nucleus, nucleus_distance, fov_name,
+        # codeword_index, etc., to save massive RAM)
         core_cols = ['transcript_id', 'cell_id', 'feature_name', 'x_location', 'y_location', 'qv']
-        
+        # is_gene: correct, complete real-gene-vs-control flag (confirmed
+        # 2026-10-23: matches codeword_category == 'predesigned_gene' with
+        # zero crossover on a real 147M-row file) -- replaces the old
+        # name-regex filter in build_cells_xenium(), which was silently
+        # missing *_control_probe categories (they're "...Probe"-suffixed,
+        # not "...Codeword"-suffixed, so the regex never caught them).
+        # codeword_category: kept (not just the boolean) since per-cell
+        # negative-control counts are a useful noise/background QC covariate,
+        # not just something to drop -- only 6 distinct values, so it costs
+        # almost nothing once AnnData's write_zarr() auto-categoricals it,
+        # same as feature/cell_id already get.
+        optional_cols = ['is_gene', 'codeword_category']
+
         if tx_path.suffix == '.parquet':
             # Parquet allows us to read only the columns we want, saving tons of memory!
-            df = pd.read_parquet(tx_path, columns=core_cols)
+            # Older Xenium Ranger outputs may not have is_gene/codeword_category
+            # (newer-only columns) -- check the schema first rather than
+            # letting read_parquet's columns= raise on a missing column.
+            import pyarrow.parquet as pq
+            available = set(pq.ParquetFile(tx_path).schema.names)
+            cols_to_read = core_cols + [c for c in optional_cols if c in available]
+            df = pd.read_parquet(tx_path, columns=cols_to_read)
         else:
             # CSV requires reading everything, then dropping
             df = pd.read_csv(tx_path)
-            df = df[[c for c in core_cols if c in df.columns]]
+            df = df[[c for c in core_cols + optional_cols if c in df.columns]]
             
         # ==========================================
         # platpy STANDARDIZATION
@@ -162,27 +211,35 @@ def _load_transcripts(x_dir: Path) -> Optional[OmicChannel]:
         if rename_map:
             df = df.rename(columns=rename_map)                  # type: ignore
             
-        # Normalize to AnnData so the save/load pipeline is consistent with Visium.
-        # Transcript rows become obs; spatial coords go into obsm['spatial'].
-        # This conversion is slow on first load but only happens once before save.
-        obs_df = df.reset_index(drop=True)
-        obs_df.index = obs_df.index.astype(str)
-        adata = ad.AnnData(obs=obs_df)
-        adata.obsm['spatial'] = df[['x', 'y']].values
-
+        # Sort the lean plain DataFrame BEFORE ever wrapping it in AnnData --
+        # not after. The old order built the AnnData first, then
+        # build_spatial_block_index()'s row-reorder copied that whole
+        # already-AnnData-wrapped object just to sort it, meaning two
+        # full-weight copies of the (much larger) wrapped version existed
+        # simultaneously at peak. Sorting a plain DataFrame is the same
+        # unavoidable reorder-copy cost, just against something far leaner.
+        # platpy stays DataFrame-only all the way to save_sample(), which
+        # wraps each pyramid level in AnnData right before write_zarr() --
+        # there's no cell x gene X matrix here to justify holding AnnData's
+        # overhead for the whole ingest, only at the point it's actually
+        # needed. See project_platpy_bundle_creation_memory memory / the
+        # 2026-10-23 OOM report this traces back to.
+        df = df.reset_index(drop=True)
         logger.info("   - Sorting transcripts by spatial block and building index...")
-        adata = build_spatial_block_index(adata, mpp=0.2125, gene_col='feature')
-        _bi = json.loads(adata.uns['block_index'])
+        df, block_index_json = build_spatial_block_index(df, mpp=0.2125, gene_col='feature')
+        _bi = json.loads(block_index_json)
         logger.info(f"     + Block index: {len(_bi['blocks'])} blocks ({_bi['block_size_um']:.1f} µm each)")
 
         return OmicChannel(
             name="transcripts",
-            data=adata,
+            data=df,
             metadata={
                 "platform": "xenium",
                 "is_continuous": True,
                 "source": tx_path.name,
-                "total_transcripts": len(df)
+                "total_transcripts": len(df),
+                "block_index": block_index_json,
+                "opt_block_index_version": OPT_BLOCK_INDEX_VERSION,
             }
         )
         
@@ -243,10 +300,14 @@ def load_xenium(x_dir: str | Path, name: str = "XeniumSample", load_boundaries: 
 
             def _load_level(target_level):
                 level = min(target_level, available_levels - 1)
-                scale = base_shape[-1] / series.levels[level].shape[-1]
                 lvl = series.levels[level]
+                scale = base_shape[-1] / lvl.shape[-1]
+                # lvl.shape/.dtype (header metadata, already parsed when tif
+                # was opened above) are read eagerly here, safe and cheap --
+                # only the actual pixel read (the expensive, race-prone part)
+                # is deferred to a delayed call with its own fresh handle.
                 arr = da.from_delayed(
-                    dask.delayed(lvl.asarray)(),
+                    dask.delayed(_read_tiff_level)(img_path, level),
                     shape=lvl.shape,
                     dtype=lvl.dtype
                 )

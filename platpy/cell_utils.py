@@ -39,7 +39,7 @@ def _encode_coord(val_um, precision=10):
 # builds (adata.uns['build_cells_xenium_version']) so a save-time cache from
 # an older platpy is never silently trusted as if it were current -- see
 # save_sample()'s build_default_cells handling in io_utils.py.
-BUILD_CELLS_XENIUM_VERSION = 2
+BUILD_CELLS_XENIUM_VERSION = 3
 
 
 def build_cells_xenium(sample, roi=None, discard_straddlers: bool = True,
@@ -153,10 +153,22 @@ def build_cells_xenium(sample, roi=None, discard_straddlers: bool = True,
                     (tx['y'] >= min_y) & (tx['y'] <= max_y)]
         else:
             tx = tx_data.materialize()
-        tx = tx[['cell_id', 'feature', 'x', 'y']].copy()
+        select_cols = ['cell_id', 'feature', 'x', 'y']
+        if 'is_gene' in tx.columns:
+            select_cols.append('is_gene')
+        tx = tx[select_cols].copy()
     else:
-        # Non-lazy fallback (in-memory-constructed data, older bundles, etc.)
-        tx = tx_data.obs[['cell_id', 'feature', 'x', 'y']].copy()
+        # Non-lazy fallback: tx_data is a plain DataFrame for a freshly
+        # load_xenium()'d sample not yet saved (platpy's ingestion no longer
+        # wraps transcripts in AnnData until save_sample() does, right before
+        # write), or an AnnData for an older in-memory object / pre-this-fix
+        # bundle -- hasattr distinguishes them the same way elsewhere in this
+        # codebase handles the same AnnData-or-DataFrame ambiguity.
+        tx_src = tx_data.obs if hasattr(tx_data, 'obs') else tx_data
+        select_cols = ['cell_id', 'feature', 'x', 'y']
+        if 'is_gene' in tx_src.columns:
+            select_cols.append('is_gene')
+        tx = tx_src[select_cols].copy()
         if roi is not None:
             min_x, max_x, min_y, max_y = roi
             tx = tx[(tx['x'] >= min_x) & (tx['x'] <= max_x) &
@@ -197,16 +209,27 @@ def build_cells_xenium(sample, roi=None, discard_straddlers: bool = True,
                 print(f"Discarded {n_before - n_after:,} straddler cell(s) "
                       f"(boundary polygon not entirely inside roi) of {n_before:,}.")
 
-    # Drop Xenium internal codewords (not real genes)
-    codeword_mask = tx['feature'].str.contains(
-        r'^(?:NegControl|Unassigned|Deprecated|BLANK)Codeword', regex=True
-    )
-    n_codeword = codeword_mask.sum()
+    # Drop non-gene transcripts (negative/genomic controls, deprecated/
+    # unassigned codewords). Prefer the raw is_gene flag when present --
+    # confirmed 2026-10-23 against a real 147M-row file to be a correct,
+    # complete ground-truth (matches codeword_category == 'predesigned_gene'
+    # with zero crossover). Older bundles saved before is_gene was read fall
+    # back to the previous name-regex filter, which has a known gap: it only
+    # catches "...Codeword"-suffixed names, missing the "...Probe"-suffixed
+    # negative_control_probe/genomic_control_probe categories entirely --
+    # reingest (with is_gene present) to get the complete filter instead.
+    if 'is_gene' in tx.columns:
+        non_gene_mask = ~tx['is_gene'].astype(bool)
+    else:
+        non_gene_mask = tx['feature'].str.contains(
+            r'^(?:NegControl|Unassigned|Deprecated|BLANK)Codeword', regex=True
+        )
+    n_codeword = non_gene_mask.sum()
     if n_codeword > 0:
-        tx = tx[~codeword_mask]
+        tx = tx[~non_gene_mask]
         if verbose:
-            print(f"Dropped {n_codeword:,} codeword transcripts "
-                  f"(NegControl/Unassigned/Deprecated/BLANK)")
+            print(f"Dropped {n_codeword:,} non-gene transcripts "
+                  f"(negative/genomic controls, deprecated/unassigned codewords)")
 
     if verbose:
         print(f"Transcripts assigned to cells: {len(tx):,}")

@@ -36,24 +36,38 @@ OPT_TRANSCRIPT_DISPLAY_STATS_VERSION = 1
 
 def build_spatial_block_index(adata, mpp, chunk_px=1024, gene_col=None):
     """
-    Sort AnnData rows by spatial Dask block (aligned to chunk_px x mpp microns),
-    then optionally by gene within each block. Stores a block->row-range lookup
-    in adata.uns['block_index']. Done once at initial load; persists in Zarr.
+    Sort rows by spatial Dask block (aligned to chunk_px x mpp microns), then
+    optionally by gene within each block. Stores a block->row-range lookup.
+    Done once at initial load; persists in Zarr.
 
     Parameters
     ----------
-    adata     : AnnData with obsm['spatial'] = (N, 2) float [x_um, y_um]
+    adata     : AnnData with obsm['spatial'] = (N, 2) float [x_um, y_um], OR a
+                plain DataFrame with 'x'/'y' columns. The DataFrame path
+                exists so Xenium's ingestion can sort the raw transcript
+                table by spatial block BEFORE paying AnnData's construction
+                overhead rather than after -- sorting (which needs a full
+                reordered copy regardless) is much cheaper against a lean
+                DataFrame than against an already-AnnData-wrapped object,
+                and avoids ever holding two full-weight copies of the
+                (much larger) wrapped version in memory at once. See
+                xenium_loader.py's _load_transcripts().
     mpp       : float — microns per pixel of the reference morphology image
     chunk_px  : int   — image chunk size in pixels (default 1024, matches io_utils save)
-    gene_col  : str or None — obs column for secondary sort (e.g. 'feature' for Xenium)
+    gene_col  : str or None — column for secondary sort (e.g. 'feature' for Xenium)
 
     Returns
     -------
-    adata_sorted : new AnnData with rows reordered; original is unchanged
+    AnnData in -> sorted AnnData out (uns['block_index'] set), matching the
+    original behavior. DataFrame in -> (sorted_df, block_index_json) tuple --
+    a plain DataFrame has no .uns to carry the index on, so it's returned
+    alongside instead; the caller is responsible for persisting it (e.g. in
+    an OmicChannel's .metadata, or on an AnnData's .uns once one exists).
     """
     block_um = chunk_px * mpp
-    coords = adata.obsm['spatial']  # (N, 2): col0=x, col1=y
-    assert not np.any(np.isnan(coords)), "NaN coordinates in obsm['spatial'] — cannot sort by block"
+    is_df = isinstance(adata, pd.DataFrame)
+    coords = adata[['x', 'y']].to_numpy() if is_df else adata.obsm['spatial']
+    assert not np.any(np.isnan(coords)), "NaN coordinates — cannot sort by block"
 
     # Floor division (not truncation) so negative coordinates land in the correct block.
     # e.g. x=-400, block_um=333: floor gives bx=-2 (correct), int() gives bx=-1 (wrong).
@@ -61,13 +75,14 @@ def build_spatial_block_index(adata, mpp, chunk_px=1024, gene_col=None):
     by = np.floor(coords[:, 1] / block_um).astype(int)
 
     if gene_col is not None:
-        sort_df = pd.DataFrame({'by': by, 'bx': bx, 'gene': adata.obs[gene_col].values})
+        gene_vals = adata[gene_col].values if is_df else adata.obs[gene_col].values
+        sort_df = pd.DataFrame({'by': by, 'bx': bx, 'gene': gene_vals})
         order = sort_df.sort_values(['by', 'bx', 'gene']).index.to_numpy()
     else:
         sort_df = pd.DataFrame({'by': by, 'bx': bx})
         order = sort_df.sort_values(['by', 'bx']).index.to_numpy()
 
-    adata_sorted = adata[order].copy()
+    adata_sorted = adata.iloc[order].reset_index(drop=True) if is_df else adata[order].copy()
 
     # Find contiguous runs using pairwise comparison — avoids hash collisions with negative indices.
     s_bx = bx[order]
@@ -98,12 +113,21 @@ def build_spatial_block_index(adata, mpp, chunk_px=1024, gene_col=None):
     # Store as a JSON string — AnnData's zarr backend converts list-of-dicts
     # entries in uns to str() representations (single quotes, not JSON-compatible).
     # A single string value round-trips correctly through zarr.
-    adata_sorted.uns['block_index'] = json.dumps({
+    block_index_json = json.dumps({
         'block_size_um': float(block_um),
         'mpp':           float(mpp),
         'chunk_px':      int(chunk_px),
         'blocks':        blocks,
     })
+
+    if is_df:
+        # No .uns to carry this on -- hand it back alongside instead; the
+        # caller persists it wherever makes sense (OmicChannel.metadata until
+        # an AnnData exists, then its .uns -- see xenium_loader.py and
+        # save_sample()'s pyramid-normalization step).
+        return adata_sorted, block_index_json
+
+    adata_sorted.uns['block_index'] = block_index_json
     # Independent version counters (see PLATPY_FORMAT_VERSION block above) — kept as
     # separate uns keys rather than nested inside block_index's own JSON blob, even
     # though both features are built right here, so each can be bumped/tested on its
@@ -551,7 +575,20 @@ def save_sample(
                     for k, v in level_data.uns.items():
                         level_adata.uns[k] = v
                 elif isinstance(level_data, pd.DataFrame):
-                    level_adata = ad.AnnData(obs=level_data)
+                    # Fresh ingestion (xenium_loader.py's _load_transcripts())
+                    # stays a plain DataFrame all the way here -- this is the
+                    # one place it finally gets wrapped, right before write,
+                    # instead of up front at load time (see that function's
+                    # comment for why: avoids ever holding two full-weight
+                    # AnnData-sized copies at once during the spatial sort).
+                    df = level_data.reset_index(drop=True)
+                    df.index = df.index.astype(str)
+                    level_adata = ad.AnnData(obs=df)
+                    level_adata.obsm['spatial'] = df[['x', 'y']].to_numpy()
+                    if 'block_index' in omic_chan.metadata:
+                        level_adata.uns['block_index'] = omic_chan.metadata['block_index']
+                        level_adata.uns['opt_block_index_version'] = omic_chan.metadata.get(
+                            'opt_block_index_version', OPT_BLOCK_INDEX_VERSION)
                 else:
                     level_adata = level_data
                 normalized_pyramid[bin_um] = level_adata
