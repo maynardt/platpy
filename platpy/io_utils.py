@@ -327,10 +327,96 @@ def build_transcript_display_stats_table(adata, platform: str, bin_um: Optional[
                 'genes': gene_table, 'genes_reduced': genes_reduced}
 
 
-def _remove_readonly(func, path, exc):
-    """Clear the readonly bit and re-attempt purge (Windows fix)."""
-    os.chmod(path, stat.S_IWRITE)
-    func(path)
+def _force_remove_tree(path):
+    """
+    Removes a directory tree, clearing Windows readonly bits first (a stale
+    read-only file, e.g. left by a previous crashed write, would otherwise
+    block a plain shutil.rmtree). Avoids shutil.rmtree's onerror/onexc
+    callback entirely -- onexc is 3.12+ only and onerror's callback
+    signature changed across versions, so clearing permissions up front is
+    the one approach that doesn't depend on the running Python's version.
+    """
+    for root, dirs, files in os.walk(path):
+        for entry in dirs + files:
+            try:
+                os.chmod(os.path.join(root, entry), stat.S_IWRITE)
+            except OSError:
+                pass
+    shutil.rmtree(path)
+
+
+# Big per-row transcript arrays worth resharding -- everything else in the
+# bundle (categories, var, uns, small metadata) is tiny and left at
+# AnnData's own default chunking.
+_RESHARD_1D_PATHS = ['obs/x', 'obs/y', 'obs/qv', 'obs/transcript_id', 'obs/is_gene',
+                      'obs/feature/codes', 'obs/cell_id/codes', 'obs/codeword_category/codes']
+
+
+def _reshard_transcript_arrays(dest_path, n_obs: int, block_index_json: Optional[str],
+                                min_chunk_rows: int = 20_000, max_chunk_rows: int = 100_000,
+                                target_shard_rows: int = 500_000):
+    """
+    Re-chunks the big per-row transcript arrays AnnData's write_zarr() just
+    wrote, using a row-count-informed uniform chunk size grouped into zarr
+    v3 shards -- AnnData.write_zarr() has no `shards` param, and its own
+    default per-array chunking is purely byte-size-driven (same chunk BYTE
+    budget per array, so e.g. a uint64 column gets half the row-chunk of a
+    float32 one) with zero spatial awareness: a small ROI query was measured
+    (2026-10-25, real data) to read 4-8x more rows than it needed under
+    that default. Sharding was confirmed (2026-10-25, via zarr-python's
+    sharding codec source + a direct byte-range-read check) to genuinely
+    fetch only the inner chunk(s) a partial read needs, not the whole shard
+    -- so this gets small, query-friendly inner chunks without an explosion
+    of small files on disk (verified: 725 -> 445 files on the 21.99M-row
+    cropped test slide).
+
+    True variable/ragged per-region chunk sizes (one physical chunk per
+    Mondrian bucket or spatial block, each sized to its own local density)
+    aren't available in stable zarr yet -- "rectilinear chunk grids" is an
+    experimental, likely-v4-era proposal. This is the available proxy: one
+    informed uniform inner-chunk size (from the real block_index's median
+    block row count, clamped to [min_chunk_rows, max_chunk_rows]), not a
+    per-block/per-bucket custom size. Shelved until rectilinear grids ship
+    -- see project_platpy_streaming_ingestion memory.
+
+    CRITICAL, confirmed the hard way (2026-10-25): the bundle has
+    consolidated metadata (write_zarr produces it), which caches every
+    array's chunk/shard shape. Rewriting arrays in place without
+    re-consolidating left that cache stale -- reads then decoded the NEW
+    chunk/shard bytes using the OLD cached shape, producing a zstd
+    "destination buffer too small" error on every single array, not just
+    the resharded ones. zarr.consolidate_metadata() at the end is required,
+    not optional.
+    """
+    if not block_index_json or n_obs == 0:
+        return
+    blocks = json.loads(block_index_json).get('blocks', [])
+    if not blocks:
+        return
+    block_sizes = sorted(b['row_end'] - b['row_start'] for b in blocks)
+    median_block_rows = block_sizes[len(block_sizes) // 2]
+    chunk_rows = int(np.clip(2 * median_block_rows, min_chunk_rows, max_chunk_rows))
+    shard_rows = int(-(-target_shard_rows // chunk_rows) * chunk_rows)  # round up to a multiple
+
+    root = zarr.open_group(str(dest_path), mode='a')
+    for path in _RESHARD_1D_PATHS:
+        if path not in root:
+            continue
+        arr = root[path]
+        if arr.shape[0] != n_obs:
+            continue
+        root.create_array(path, chunks=(chunk_rows,), shards=(shard_rows,),
+                           data=arr[:], overwrite=True)
+
+    if 'obsm/spatial' in root:
+        data = root['obsm/spatial'][:]
+        root.create_array('obsm/spatial', chunks=(chunk_rows, data.shape[1]),
+                           shards=(shard_rows, data.shape[1]), data=data, overwrite=True)
+
+    zarr.consolidate_metadata(root.store)
+    logger.info(f"     + Re-sharded transcript arrays: chunk_rows={chunk_rows:,}, "
+                f"shard_rows={shard_rows:,} (median block size {median_block_rows:,})")
+
 
 def _numpy_encoder(obj: Any) -> Any:
     """Helper to convert numpy arrays/types to standard JSON for Zarr attributes."""
@@ -454,7 +540,7 @@ def save_sample(
 
         # Explicitly remove existing morph directory if overwrite is enabled
         if overwrite and morph_path.exists():
-            shutil.rmtree(morph_path, onexc=_remove_readonly)
+            _force_remove_tree(morph_path)
 
         morph_path.mkdir(parents=True, exist_ok=True)
 
@@ -548,7 +634,7 @@ def save_sample(
         for name, omic_chan in sample.omics.items():
             chan_dir = omics_dir / name
             if overwrite and chan_dir.exists():
-                shutil.rmtree(chan_dir, onexc=_remove_readonly)
+                _force_remove_tree(chan_dir)
             chan_dir.mkdir(exist_ok=True)
 
             spatial_list = np.array(omic_chan.spatial_meta.transform_matrix).tolist()
@@ -623,6 +709,12 @@ def save_sample(
                 dest_path = chan_dir / f"{float(bin_um):.1f}um.zarr"
                 adata_level.write_zarr(dest_path)
 
+                if platform == 'xenium' and name == 'transcripts':
+                    _reshard_transcript_arrays(
+                        dest_path, adata_level.n_obs,
+                        adata_level.uns.get('block_index'),
+                    )
+
             logger.info(f"  + Saved Omic Channel: {name} (levels: {sorted(omic_chan.pyramid.keys())})")
 
     # ========
@@ -645,7 +737,7 @@ def save_sample(
         for name, cell_chan in sample.cells.items():
             dest_path = cells_dir / f"{name}.zarr"
             if overwrite and dest_path.exists():
-                shutil.rmtree(dest_path, onexc=_remove_readonly)
+                _force_remove_tree(dest_path)
 
             # A resave always needs the real boundaries/data regardless of
             # whether anything touched them yet -- write_zarr() needs actual
@@ -678,7 +770,7 @@ def save_sample(
                 cell_data = _resolve_lazy(cell_chan.data)
                 data_path = cells_dir / f"{name}_cells.zarr"
                 if overwrite and data_path.exists():
-                    shutil.rmtree(data_path, onexc=_remove_readonly)
+                    _force_remove_tree(data_path)
                 cell_data.write_zarr(data_path)
                 logger.info(f"  + Saved Cell x Gene Matrix: {name} "
                             f"({cell_data.n_obs:,} cells x {cell_data.n_vars:,} genes)")

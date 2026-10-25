@@ -32,6 +32,7 @@ dependencies = [
     "tifffile>=2024.1",
     "igraph",
     "leidenalg",
+    "psutil",
 ]
 
 [project.optional-dependencies]
