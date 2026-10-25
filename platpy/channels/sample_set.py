@@ -122,13 +122,17 @@ class SampleSet:
             platform = omic.metadata.get('platform', 'visium')
             if platform == 'xenium':
                 import anndata as ad
+                import pandas as pd
                 from ..lazy_transcripts import LazyTranscripts
 
                 # Parent's block_index (mpp/chunk_px) is what the fresh index
                 # below gets rebuilt from -- grab it before it's out of reach,
-                # regardless of which branch produces `extracted`.
+                # regardless of which branch produces `extracted`. A plain
+                # DataFrame (fresh ingestion, not yet saved/reloaded) has no
+                # .uns -- its block_index lives on omic.metadata instead
+                # (set by xenium_loader.py's _load_transcripts()).
                 parent_uns = omic.data.uns if hasattr(omic.data, 'uns') else {}
-                parent_block_index = parent_uns.get('block_index')
+                parent_block_index = parent_uns.get('block_index') or omic.metadata.get('block_index')
 
                 if isinstance(omic.data, LazyTranscripts):
                     # Lazy parent -- only materialize the blocks overlapping this
@@ -137,6 +141,23 @@ class SampleSet:
                         min_x_um, max_x_um, min_y_um, max_y_um
                     )
                     df = omic.data.materialize(hit_ranges)
+                    mask = (
+                        (df['x'].to_numpy() >= min_x_um) & (df['x'].to_numpy() <= max_x_um) &
+                        (df['y'].to_numpy() >= min_y_um) & (df['y'].to_numpy() <= max_y_um)
+                    )
+                    df = df.loc[mask].reset_index(drop=True)
+                    df.index = df.index.astype(str)
+                    extracted = ad.AnnData(obs=df)
+                    extracted.obsm['spatial'] = df[['x', 'y']].to_numpy()
+                elif isinstance(omic.data, pd.DataFrame):
+                    # Fresh ingestion, not yet saved/reloaded -- omic.data is
+                    # still a plain DataFrame (see xenium_loader.py's
+                    # _load_transcripts(): stays DataFrame-only all the way
+                    # to save_sample(), only wrapped in AnnData right before
+                    # write_zarr()). No .uns/block_index to pre-filter
+                    # against yet, but it's already fully in memory either
+                    # way, so just mask directly.
+                    df = omic.data
                     mask = (
                         (df['x'].to_numpy() >= min_x_um) & (df['x'].to_numpy() <= max_x_um) &
                         (df['y'].to_numpy() >= min_y_um) & (df['y'].to_numpy() <= max_y_um)

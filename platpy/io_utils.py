@@ -468,25 +468,37 @@ def _sanitize_for_zarr(obj: Any) -> Any:
 def _derive_transcript_display_stats_bin_um(sample: SampleSet, omic_chan: OmicChannel) -> float:
     """
     Picks a spatial bin size for transcript_display_stats's Xenium pseudo-render
-    histogram: the second-coarsest level of an image channel's pyramid in the
-    same sample (any one -- they're registered to the same coordinate system,
-    so which specific channel doesn't matter). Deliberately not the coarsest
-    (thumbnail) level, which would cover far more area per bin than a realistic
-    interactive-viewing resolution and under-represent the contrast a user
-    actually sees when zoomed in.
+    histogram -- a realistic interactive gene-density-viewing resolution.
 
-    Falls back to the same spatial block size build_spatial_block_index()
-    already uses (chunk_px x mpp) if no image is present, or its pyramid has
-    fewer than 2 levels (e.g. generate_pyramid() was never called).
+    FIXED (2026-10-25): previously derived from "the second-coarsest level of
+    an image channel's pyramid" -- but that pyramid represents MORPHOLOGY
+    IMAGE pixel resolution, which xenium_loader.py always populates with
+    exactly 3 fixed levels (base, 2x, 8x downsample from the native ~0.2125
+    mpp), regardless of ROI size or source TIFF. "Second-coarsest" of that
+    fixed set is always the 2x level (~0.425um) -- nowhere near a realistic
+    *gene-density* viewing scale (confirmed via real rendering code: this
+    vignette itself renders gene density at bin_um 8-20). _precomputed_p_hi()
+    scales this reference by AREA RATIO to whatever bin_um a render actually
+    uses, which assumes uniform transcript density -- wrong for real tissue,
+    where transcripts cluster in cells rather than spreading uniformly. For
+    a 0.425um reference scaled up to a 20um render, that's a ~2214x area
+    ratio -- confirmed on real data to inflate p_hi from a true ~3.6 to
+    2214.5, crushing real signal to invisible (rgb values ~1.6% of full
+    intensity after normalization). The two reference scales are simply
+    unrelated physical concepts -- image pixel resolution isn't gene-density
+    bin resolution -- so deriving one from the other was never going to be
+    reliable regardless of which pyramid level got picked.
+
+    Using a fixed ~10um reference instead (roughly a single cell diameter,
+    matching the realistic-interactive-viewing intent the function always
+    had) -- close enough to the 8-20um bin_um range real renders actually
+    use that the area-scaling extrapolation stays safe in both directions.
+    Confirmed on real data: a 10um reference predicts p_hi~4.0 for a 20um
+    render, matching the true freshly-computed value (~3.6) far more
+    closely than either the old 0.425um reference (2214.5) or even the
+    pyramid's coarsest 8x level (1.7um -> 138.4).
     """
-    for img_chan in sample.images.values():
-        levels = sorted(img_chan.pyramid.keys())
-        if len(levels) >= 2:
-            return levels[-2]
-        elif levels:
-            return levels[-1]
-    mpp = float(omic_chan.spatial_meta.transform_matrix[0, 0])
-    return 1024 * mpp
+    return 10.0
 
 
 def save_sample(

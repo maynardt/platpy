@@ -595,7 +595,7 @@ def _load_transcripts(x_dir: Path, streaming: Union[bool, str] = "auto", max_buc
     return None
 
 
-def load_xenium(x_dir: str | Path, name: str = "XeniumSample", load_boundaries: bool = True, force_8bit=True,
+def load_xenium(x_dir: str | Path, name: str = "XeniumSample", load_boundaries: bool = True, force_8bit=False,
                  debug: bool = False, streaming_load: Union[bool, str] = "auto", max_buckets: int = 8,
                  swap_dir: Optional[str | Path] = None, n_workers: Optional[int] = None,
                  memory_budget_gb: float = 8.0, auto_streaming_margin: float = 0.5) -> SampleSet:
@@ -603,6 +603,19 @@ def load_xenium(x_dir: str | Path, name: str = "XeniumSample", load_boundaries: 
     Ingests a Xenium output directory into the platpy framework.
     Maps morphology images to the Visium multi-res standard using Dask/Zarr
     and Absolute Spatial Truth (Affine Matrices).
+
+    force_8bit: defaults to False (2026-10-25) -- was originally True to
+        shrink bundle size, but zarr's own compression already handles that
+        without needing a lossy bit-depth reduction, and ViewPort's render
+        path already normalizes non-uint8 images on the fly (percentile-
+        based, not a dtype-max divide -- see viewport.py), materializing
+        only the cropped region being viewed. to_8bit() itself eagerly
+        materializes the full base-resolution array per channel (confirmed
+        on a real slide: a 4-channel, 61212x48320 uint16 image put ingestion
+        memory right at the edge of OOM) for a display benefit the lazy
+        path already provides for free. Left available (not removed) for
+        anyone who explicitly wants a lossy uint8 bundle for some other
+        reason.
 
     streaming_load: alternative transcript-loading path for sections too
         large to comfortably read+sort in one piece -- streams the raw

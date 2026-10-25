@@ -166,7 +166,15 @@ class ImageChannel(BaseChannel):
             clipped = np.clip((a.astype(np.float32) - p_lo) / (p_hi - p_lo), 0.0, 1.0)
             return (clipped * 255).astype(np.uint8)
 
-        new_pyramid = {mpp: _apply(arr) for mpp, arr in self.pyramid.items()}
+        # base_arr is already materialized above (needed for the percentile
+        # calculation) -- re-running _apply() on self.pyramid[self.mpp] (the
+        # same base level) would call .compute() on the same dask graph a
+        # second time, redundantly materializing the largest array in the
+        # pyramid twice. Reuse it directly instead.
+        new_pyramid = {
+            mpp: (_apply(base_arr) if abs(mpp - self.mpp) < 1e-9 else _apply(arr))
+            for mpp, arr in self.pyramid.items()
+        }
 
         if in_place:
             self.pyramid = new_pyramid
