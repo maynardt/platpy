@@ -96,6 +96,15 @@ class LazyTranscripts:
     feature: LazyCategorical
     cell_id: LazyCategorical
     uns: Dict = field(default_factory=dict)
+    # Newer-only columns (added 2026-10-23, see xenium_loader.py's
+    # _load_transcripts()) -- None for bundles saved before they existed,
+    # same graceful-fallback pattern the eager ingestion path already uses.
+    # Real-world need confirmed 2026-10-29 (cross-session report, "Xenium
+    # processing part 1"): control-probe/codeword exclusion on raw per-
+    # molecule data needs these available without falling back to a
+    # slower, fully-materialized path.
+    is_gene: Optional[da.Array] = None
+    codeword_category: Optional[LazyCategorical] = None
     _cached_obs: Any = field(default=None, repr=False, init=False)
 
     @property
@@ -132,8 +141,9 @@ class LazyTranscripts:
         """
         Pull the given row ranges (or everything, if row_ranges is None) into
         a real, small, in-memory DataFrame -- columns: transcript_id, cell_id,
-        feature, x, y, qv. This is the one place actual data gets read and
-        computed; everything before this call stays lazy.
+        feature, x, y, qv, plus is_gene/codeword_category when the saved
+        bundle has them (older bundles won't). This is the one place actual
+        data gets read and computed; everything before this call stays lazy.
 
         opt_cutoff: once row_ranges covers at least this percentage of
         n_obs, read everything via one contiguous slice and boolean-mask down
@@ -161,24 +171,34 @@ class LazyTranscripts:
         return self._materialize_idx(row_idx)
 
     def _empty_frame(self) -> pd.DataFrame:
-        return pd.DataFrame({
+        cols = {
             'transcript_id': pd.array([], dtype='uint64'),
             'cell_id': pd.array([], dtype='object'),
             'feature': pd.array([], dtype='object'),
             'x': pd.array([], dtype='float32'),
             'y': pd.array([], dtype='float32'),
             'qv': pd.array([], dtype='float32'),
-        })
+        }
+        if self.is_gene is not None:
+            cols['is_gene'] = pd.array([], dtype='bool')
+        if self.codeword_category is not None:
+            cols['codeword_category'] = pd.array([], dtype='object')
+        return pd.DataFrame(cols)
 
     def _materialize_idx(self, idx) -> pd.DataFrame:
-        return pd.DataFrame({
+        cols = {
             'transcript_id': np.asarray(self.transcript_id[idx].compute()),
             'cell_id':       self.cell_id.materialize(idx),
             'feature':       self.feature.materialize(idx),
             'x':             np.asarray(self.x[idx].compute()),
             'y':             np.asarray(self.y[idx].compute()),
             'qv':            np.asarray(self.qv[idx].compute()),
-        })
+        }
+        if self.is_gene is not None:
+            cols['is_gene'] = np.asarray(self.is_gene[idx].compute())
+        if self.codeword_category is not None:
+            cols['codeword_category'] = self.codeword_category.materialize(idx)
+        return pd.DataFrame(cols)
 
 
 def read_zarr_scalar_dict(group: zarr.Group) -> Dict:
@@ -208,6 +228,10 @@ def load_transcripts_lazy(zarr_path) -> LazyTranscripts:
     lazily -- reads shape/dtype metadata, the small categorical lookup
     tables, and uns (block_index etc.) eagerly; x/y/qv/transcript_id and the
     feature/cell_id codes stay dask-backed until materialize() is called.
+
+    is_gene/codeword_category are wired up the same lazy way when present
+    (newer bundles only -- schema check, not a try/except, so a genuinely
+    missing/corrupt group still fails loudly instead of silently vanishing).
     """
     root = zarr.open_group(str(zarr_path), mode='r')
     obs = root['obs']
@@ -219,10 +243,13 @@ def load_transcripts_lazy(zarr_path) -> LazyTranscripts:
     transcript_id = da.from_zarr(obs['transcript_id'])
     feature = _read_lazy_categorical(obs['feature'])
     cell_id = _read_lazy_categorical(obs['cell_id'])
+    is_gene = da.from_zarr(obs['is_gene']) if 'is_gene' in obs else None
+    codeword_category = _read_lazy_categorical(obs['codeword_category']) if 'codeword_category' in obs else None
 
     uns = read_zarr_scalar_dict(root['uns']) if 'uns' in root else {}
 
     return LazyTranscripts(
         n_obs=n_obs, x=x, y=y, qv=qv, transcript_id=transcript_id,
         feature=feature, cell_id=cell_id, uns=uns,
+        is_gene=is_gene, codeword_category=codeword_category,
     )

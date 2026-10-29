@@ -823,6 +823,44 @@ def save_sample(
 ################################
 
 
+def _read_cell_boundaries_fast(path) -> pd.DataFrame:
+    """
+    Reads a saved cell-boundaries zarr store's per-vertex obs table
+    directly, bypassing ad.read_zarr() -- which pays full AnnData-
+    construction cost (obs-index build, pandas Categorical reconstruction)
+    every time, the same cost class already proven slow for transcripts
+    (see lazy_transcripts.py's _read_lazy_categorical()). Confirmed
+    real-world need (2026-10-29, cross-session report): the cell_id
+    categorical alone was measured at 81% of a boundary table's in-memory
+    footprint on a real 6.98M-vertex bundle.
+
+    No partial-read benefit for this table (lazy_value.py's own reasoning
+    still holds -- the only win available for a cell-boundary table is not
+    reading it at all when nothing asks, which the Deferred wrapper around
+    this function already provides), so this reads everything eagerly,
+    just via plain zarr/numpy instead of AnnData's slower path.
+
+    Iterates the actual on-disk schema (not a hardcoded cell_id/x/y) so any
+    other obs column some caller reads isn't silently dropped. '_index' is
+    skipped deliberately -- AnnData treats it as the row index, never a
+    regular obs column, and ad.read_zarr(path).obs doesn't expose it either.
+    """
+    root = zarr.open_group(str(path), mode='r')
+    obs = root['obs']
+    cols = {}
+    for key in obs.array_keys():
+        if key == '_index':
+            continue
+        cols[key] = obs[key][:]
+    for key in obs.group_keys():
+        grp = obs[key]
+        if 'categories' in grp and 'codes' in grp:
+            categories = grp['categories'][:]
+            codes = grp['codes'][:]
+            cols[key] = categories[codes]
+    return pd.DataFrame(cols)
+
+
 def load_sample(in_path_str: str, verbose: bool = True, load_2um_bin: bool = False, images_only: bool = False) -> SampleSet:
     """
     Loads a platpy SampleSet from a Zarr directory structure.
@@ -1045,7 +1083,7 @@ def load_sample(in_path_str: str, verbose: bool = True, load_2um_bin: bool = Fal
                             if probe_uns is not None and 'channel_meta' in probe_uns else {})
             spatial = SpatialMetadata(transform_matrix=spatial_mat)
 
-            boundaries = Deferred(loader=lambda p=cell_path: ad.read_zarr(p))
+            boundaries = Deferred(loader=lambda p=cell_path: _read_cell_boundaries_fast(p))
 
             summary_path = cells_dir / f"{name}_summary.parquet"
             summary = pd.read_parquet(summary_path) if summary_path.exists() else None
